@@ -1,0 +1,128 @@
+\setlength{\parindent}{2em}
+
+\section{Paper Information}
+This report reviews the paper ``Learning Soft Sparse Shapes for Efficient Time-Series Classification.'' The paper revisits shapelet-based time-series classification and proposes a softer alternative to the usual hard-filtering strategy. Rather than discarding low-scoring candidate subsequences outright, it keeps strong ones individually and fuses weak ones into a weighted representation. I chose this paper because it tackles a real bottleneck in shapelet methods---the crude way they prune candidates---instead of layering on complexity for its own sake. Table \ref{tab:meta} summarizes the bibliographic details.
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{Basic information of the reviewed paper}
+\label{tab:meta}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\textwidth}{p{2.6cm}X}
+\toprule
+Item & Content \\
+\midrule
+Title & Learning Soft Sparse Shapes for Efficient Time-Series Classification \\
+Authors & Zhen Liu, Yicheng Luo, Boyuan Li, Emadeldeen Eldele, Min Wu, and Qianli Ma \\
+Venue & Proceedings of the 42nd International Conference on Machine Learning (ICML 2025) \\
+Vol./No. & Proceedings of Machine Learning Research, Vol.~267; no separate issue number \\
+Pages & 39032--39059 \\
+Year & 2025 \\
+Research Topic & Efficient and interpretable time-series classification with soft sparse shape learning \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The authors are from South China University of Technology and A*STAR. The timing is right for this kind of work. Deep models for time series keep getting more accurate, but most of them remain opaque about why they make a decision. Shapelet methods have always been interpretable, but the classical pipeline relies on hard pruning---keep a few candidates, throw away the rest. The authors try to keep the interpretability while fixing the pruning step, using ideas from sparse routing and mixture-of-experts. That connection between classical representations and newer mechanisms is what drew me to the paper.
+
+\section{Background}
+\subsection{Problem Setting}
+Time-series classification shows up everywhere: activity recognition from wearables, ECG diagnosis, equipment monitoring, finance, traffic prediction. Deep learning has pushed accuracy on these tasks, but the models are hard to interpret. In practice, knowing the predicted label is often not enough---you also need to know which temporal patterns drove the decision. An accurate but opaque model is a liability when the output informs real choices.
+
+Shapelet-based methods take a different approach. A shapelet is a short subsequence that captures a local pattern characteristic of a class. Because the model's decision is tied to specific subsequences, a domain expert can inspect the selected shapelets and check whether the model is attending to the right signals. Shapelets are an explanation interface, not merely a feature extraction trick.
+
+\subsection{Limitations of Existing Methods}
+The bottleneck in shapelet learning is efficiency. A long time series contains a huge number of candidate subsequences, and evaluating all of them is expensive. Most methods cope by applying hard sparsification: rank the candidates, keep the top few, discard the rest. This works, but it throws away information. Low-scoring shapes may still carry useful signal, and a binary keep-or-discard decision cannot capture degrees of relevance. The hard filter creates a bottleneck before the model has had a chance to learn the global class structure.
+
+SoftShape replaces this hard filter with a soft one. Strong shapes stay as individual embeddings; weak shapes are fused into a single weighted vector. The pipeline shifts from hard selection to soft compression. What I find clever is that the change is small---it only affects how you handle the low-scoring candidates---but it ripples through the rest of the design. The compression rule turns out to matter more than the representation itself.
+
+\section{Method}
+\subsection{Overall Framework}
+The model works in three stages. Sliding windows extract overlapping subsequences from the input, and a one-dimensional convolutional layer maps each to a shape embedding. A soft sparsification step then scores each shape by classification contribution: high-scoring shapes are kept individually, low-scoring shapes are fused. Finally, a soft shape learning block processes the sparsified set, learning both patterns within each shape and dependencies across shapes before classification.
+
+The design keeps the local-pattern perspective of shapelet methods while adding soft weighting and expert routing. What I like is that the authors do not throw out the original inductive bias of shapelets---the idea that local subsequences carry discriminative information---but ask how that bias can survive inside a more expressive system. That tends to work better than starting from scratch.
+
+\subsection{Soft Shape Sparsification}
+The model extracts shape embeddings $\hat{S}_{n,p}^{m}$ from sliding windows of length $m$ and step size $q$. A gated attention mechanism estimates each shape's contribution score:
+\[
+\alpha(\hat{S}_{n,p}^{m})=\sigma\!\left(W_2\tanh\!\left(W_1\hat{S}_{n,p}^{m}+b_1\right)+b_2\right).
+\]
+Rather than using the score for hard pruning, it creates soft representations. For top-ranked shapes:
+\[
+S_{e,n,p}^{m}=\alpha(\hat{S}_{n,p}^{m})\hat{S}_{n,p}^{m},
+\]
+and for low-scoring shapes, the model fuses them into a single weighted embedding:
+\[
+S_{e,n,\mathrm{fused}}^{m}=\sum_{p\in E}\alpha(\hat{S}_{n,p}^{m})\hat{S}_{n,p}^{m},
+\]
+where $E$ denotes the index set of shapes below the threshold. The key effect is that important local patterns stay visible as separate shapes, while weak ones still contribute through the fused term. Computation drops, but nothing gets cut off entirely.
+
+This is the core methodological idea, in my view. Compression becomes differentiable: the model learns how much to keep. In earlier shapelet methods, sparsification means ``remove as much as possible without hurting performance too much.'' In SoftShape, sparsification means ``redistribute information into a smaller but still expressive representation.'' That shift in what sparsification means is what makes the idea transferable to other pipelines that face a similar keep-or-discard choice.
+
+\subsection{Soft Shape Learning Block}
+After sparsification, a learning block with two branches processes the shapes. The intra-shape branch models temporal patterns inside each soft shape. The inter-shape branch treats the sparsified shapes as a shorter sequence and models dependencies among them.
+
+For intra-shape learning, the paper uses a mixture-of-experts router. Given a soft shape, the routing function is
+\[
+G(S_{e,n,p}^{m})=\mathrm{TOP}_k\!\left(\mathrm{softmax}(W_t S_{e,n,p}^{m})\right),
+\]
+which activates a small number of class-related experts, letting the model specialize in discriminative local patterns. Because mixture-of-experts designs tend to collapse onto a few experts, the paper adds balancing regularization and defines the training objective as
+\[
+L_{\mathrm{total}}=L_{\mathrm{ce}}+\lambda\left(L_{\mathrm{imp}}+L_{\mathrm{load}}\right).
+\]
+The extra terms push experts toward more even usage alongside the classification loss.
+
+For inter-shape learning, a shared expert network rearranges the sparsified shapes into a sequence and applies an Inception-style convolutional module to learn global dependencies. A single local pattern may be discriminative, but the relationships among several local patterns carry additional class information. What I found insightful here is that interpretability does not require limiting the model to isolated local decisions. A model can stay interpretable while reasoning over relations among its interpretable local units.
+
+The two branches answer different questions---what pattern exists inside a shape, and how multiple shapes combine into a class pattern. SoftShape's contribution is the combination of soft compression with this two-level learning. The pipeline holds together well: soft sparsification handles compression, the mixture-of-experts block learns local class-related patterns, and the shared expert captures global dependencies.
+
+\subsection{Methodological Inspirations}
+Three things from this paper stuck with me. Whenever a model uses a selective mechanism (pruning, filtering, attention), it is worth asking whether the selection really needs to be hard---soft aggregation often works better. Interpretable units and high-capacity models can coexist; SoftShape keeps interpretable local shapes while still using modern routing and expert specialization. And local evidence needs global context. Many interpretable models explain local cues well but ignore how those cues interact, which defeats the purpose when class boundaries depend on the arrangement of fragments rather than any single fragment.
+
+\section{Results}
+\subsection{Experimental Setting}
+The paper evaluates SoftShape on 128 datasets from the UCR time-series archive. To get more stable estimates, the authors merge the original training and test splits and rebuild them under five-fold cross-validation. Baselines include deep models (InceptionTime, TimesNet, ModernTCN, TSLANet), patch-based and Transformer-based methods (TST, PatchTST), and non-deep-learning classifiers such as ROCKET and MiniRocket. This mix of black-box and classical methods makes the comparison fairly comprehensive.
+
+\subsection{Main Results}
+Table \ref{tab:result-main} shows representative results. SoftShape leads on all three metrics: average accuracy, average rank, and number of wins.
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{Representative comparison of the main results}
+\label{tab:result-main}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{lccc}
+\toprule
+Method & Average Accuracy & Average Rank & Number of Wins \\
+\midrule
+InceptionTime & 0.9181 & 4.05 & 29 \\
+TSLANet & 0.9205 & 3.68 & 31 \\
+SoftShape & \textbf{0.9334} & \textbf{2.72} & \textbf{53} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+SoftShape improves average accuracy by roughly 1.29 percentage points over TSLANet and 1.53 over InceptionTime, with statistically significant gains. On a benchmark as heavily studied as UCR 128, a consistent gap of this size is hard to ignore. The numbers line up with the paper's hypothesis: the subsequences that earlier methods discard still carry class information when you represent them softly.
+
+The paper also shows interpretable visualizations. Hard shapelet selection highlights a few isolated segments; SoftShape instead produces soft discriminative regions with graded shading, where darker regions mean stronger contribution. The model can express that some regions matter more than others, rather than issuing a binary keep-or-discard verdict.
+
+\subsection{Ablation and Analysis}
+The ablation numbers are clear. Removing soft sparsification drops average accuracy to 0.9123. Removing intra-shape learning drops it to 0.9245. Removing inter-shape learning drops it to 0.9022. Removing both learning branches brings it down to 0.8696. The biggest hit comes from removing inter-shape learning, which tells us that local discriminative fragments alone are insufficient---what often separates classes is how those fragments are arranged relative to each other.
+
+The sparse-ratio analysis shows that performance stays around 0.945 when sparsity is at or below 50\%, but drops to 0.9323 and 0.9261 at 70\% and 90\%. Soft sparsification works well, but over-compression still damages the global temporal structure among shapes. Compress too much, and even an interpretable representation stops being useful for recognition.
+
+What I like about SoftShape is that it fixes a real weakness in existing shapelet pipelines instead of proposing an unnecessarily complex new formulation. Soft sparsification handles compression, the mixture-of-experts block learns local class-related patterns, and the shared expert captures global dependencies. The experiments cover the right things: main comparisons, ablations, sparsity analysis, and interpretability examples.
+
+That said, the paper has gaps. Most experiments use UCR datasets, many of which are univariate, so generalization to multivariate settings remains open. The method depends on several hyperparameters (shape length, sparsity ratio, number of experts). And although the model is more interpretable than black-box alternatives, its explanations are still model-based and may need additional visualization support for domain users. The paper also focuses on empirical effectiveness; the theoretical properties of soft shape aggregation (what temporal invariances are preserved or weakened after fusion) are left unexplored.
+
+\section{Research Inspirations}
+What I found most useful about this paper is how it thinks about research design. Representation learning and explanation do not have to be separate steps---SoftShape builds interpretability into the representation itself. ``Softening'' a rigid operation is often a productive move. Hard selection, hard assignment, and hard thresholding are common in classical pipelines, and replacing them with continuous, learnable alternatives tends to improve optimization. Local motifs need context; in many recognition tasks, the meaning of a local pattern depends on what surrounds it.
+
+There are a few directions I would like to see explored next. SoftShape could be adapted for multivariate time-series classification, where each shape would need to encode both temporal and channel-wise dependencies. Its shape representations could be initialized from foundation-model-style pretraining on large unlabeled time-series corpora. And the soft sparsification principle might carry over to weakly supervised learning, anomaly detection, or early classification---all settings where discarding information early is costly.
+
+\section{Conclusion}
+SoftShape addresses a concrete problem in shapelet-based time-series classification: hard filtering throws away too much information. By replacing hard pruning with soft sparsification and combining local expert learning with global shape-sequence modeling, the authors build a method that is both more accurate and more interpretable than earlier shapelet approaches.
+
+What I take away from this paper is less about the architecture itself and more about the research move behind it. The authors spotted the most restrictive assumption in the existing paradigm---that candidates must be either kept or discarded---and replaced it with a learnable soft mechanism. That kind of targeted revision, swapping a rigid discrete rule for a continuous alternative, strikes me as a good way to modernize an interpretable model family without losing what made it interpretable in the first place.
