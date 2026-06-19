@@ -262,3 +262,131 @@ Bugly SDK 采用缓存加批量上报的方式，不会在崩溃发生的瞬间�
 在腾讯 Bugly 上，作业的核心目标，也就是移动端崩溃、异常和 ANR 的采集与分析顺利达成，采集到的 Java 崩溃、Native 崩溃和已捕获异常记录都能在控制台正确还原堆栈。使用中也发现，Native 崩溃需要符号表才能定位、数据上报存在延迟、调试与发布模式需要区分，这几点是实际落地时要关注的。
 
 通过这次作业，我对移动端崩溃监控工具的工作模式有了直观的认识。这类工具的价值在于用嵌入 SDK 加云端聚合的方式，把分散在大量设备上的崩溃和行为数据集中成可分析、可追溯的报告，帮助开发者快速定位稳定性问题。同时也体会到，工具选型不能只看功能列表，平台的可用性比如证书维护和接口稳定性，同样是能否实际落地的关键前提。
+
+\appendix
+\section{后台核心代码}
+\subsection{用户行为服务层}
+用户行为服务层是后端处理用户行为的核心，负责把客户端上报的行为落库，并提供按用户、会话、类型和时间段的查询。其中 \texttt{getUserPageSequence} 方法从某次会话的全部行为里筛出页面进入记录，按时间顺序拼成访问路径，对应作业要求的记录访问发掘页面顺序。
+
+\begin{lstlisting}[language=Java, caption={用户行为的记录与页面顺序拼接}, label={code:appx-service}]
+@Transactional
+public UserBehavior recordBehavior(Long userId, String actionType, String actionDetail,
+                                    String pageName, String sessionId, String deviceInfo) {
+    UserBehavior behavior = new UserBehavior();
+    if (userId != null) {
+        behavior.setUser(userService.getUserById(userId)); // 关联用户
+    }
+    behavior.setActionType(actionType);   // 行为类型，如 PAGE_ENTER、CLICK
+    behavior.setPageName(pageName);
+    behavior.setSessionId(sessionId);     // 会话 id，串起一次访问的全部行为
+    return behaviorRepository.save(behavior); // 写入 H2 数据库
+}
+
+// 拼接某次会话的页面访问顺序
+public String getUserPageSequence(String sessionId) {
+    List<UserBehavior> behaviors = getSessionBehaviors(sessionId);
+    StringBuilder sequence = new StringBuilder();
+    for (UserBehavior behavior : behaviors) {
+        if (ACTION_PAGE_ENTER.equals(behavior.getActionType())) { // 只取页面进入
+            if (sequence.length() > 0) sequence.append(" -> ");
+            sequence.append(behavior.getPageName());
+        }
+    }
+    return sequence.toString();
+}
+\end{lstlisting}
+
+\subsection{数据初始化}
+数据初始化在应用启动时通过 \texttt{CommandLineRunner} 往数据库灌入测试数据，包括两个用户、五个目的地和两条攻略。这样 App 一启动就有内容可以浏览、搜索和点赞，用户行为数据才有来源。每张表都用 \texttt{count() == 0} 判断，只在表为空时灌入，避免重复启动时重复写入。
+
+\begin{lstlisting}[language=Java, caption={启动时灌入测试数据}, label={code:appx-init}]
+@Bean
+CommandLineRunner initData(UserRepository userRepository,
+                           DestinationRepository destinationRepository,
+                           TravelGuideRepository guideRepository) {
+    return args -> {
+        if (userRepository.count() == 0) {            // 表为空才初始化
+            userRepository.save(new User("testuser", "123456", "test@example.com"));
+        }
+        if (destinationRepository.count() == 0) {
+            Destination d1 = new Destination("北京", "中国首都，历史悠久", "中国");
+            d1.setRating(4.8);
+            destinationRepository.save(d1);           // 北京、上海、广州、成都、杭州
+        }
+        // 攻略同理，并通过 setDestination 关联到对应目的地
+    };
+}
+\end{lstlisting}
+
+\section{前台核心代码}
+\subsection{网络通信封装}
+网络通信用一个单例类封装 Retrofit 实例。其中 \texttt{BASE\_URL} 设为 \texttt{http://10.0.2.2:8080/}，这是 Android 模拟器访问宿主机 localhost 的特殊地址。\texttt{OkHttpClient} 配了 30 秒超时和 BODY 级别的日志拦截器，调试时能看到完整的请求和响应内容，对排查行为上报是否成功很有帮助。
+
+\begin{lstlisting}[language=Java, caption={Retrofit 的单例封装}, label={code:appx-client}]
+public class ApiClient {
+    // 模拟器访问宿主机 localhost 的特殊地址
+    private static final String BASE_URL = "http://10.0.2.2:8080/";
+    private static ApiClient instance;
+    private final ApiService apiService;
+
+    private ApiClient() {
+        HttpLoggingInterceptor logging = new HttpLoggingInterceptor();
+        logging.setLevel(HttpLoggingInterceptor.Level.BODY); // 打印完整请求体
+        OkHttpClient client = new OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .addInterceptor(logging).build();
+        Retrofit retrofit = new Retrofit.Builder()
+                .baseUrl(BASE_URL).client(client)
+                .addConverterFactory(GsonConverterFactory.create()).build();
+        apiService = retrofit.create(ApiService.class); // 动态生成接口实现
+    }
+    public static synchronized ApiClient getInstance() { /* 单例 */ }
+}
+\end{lstlisting}
+
+\subsection{API 接口定义}
+所有后端接口用一个 Java 接口声明，借助 Retrofit 的注解把 HTTP 方法、路径和参数描述清楚，分成用户、目的地、攻略、行为和测试异常五组。其中行为和测试异常两组直接服务于本作业。\texttt{ApiResponse} 是统一的响应包装，包含 success、message 和 data 三个字段，客户端据此判断调用是否成功。
+
+\begin{lstlisting}[language=Java, caption={后端接口的声明节选}, label={code:appx-api}]
+public interface ApiService {
+    // 上报用户行为，供 BehaviorTracker 调用
+    @POST("api/behavior/record")
+    Call<ApiResponse<UserBehavior>> recordBehavior(@Body Map<String, Object> behaviorData);
+
+    // 查询某会话的全部行为，用于还原页面访问顺序
+    @GET("api/behavior/session/{sessionId}")
+    Call<ApiResponse<List<UserBehavior>>> getSessionBehaviors(@Path("sessionId") String sessionId);
+
+    // 触发后台除零异常，供测试调用
+    @GET("api/test/arithmetic")
+    Call<ApiResponse<Object>> testArithmeticException(@Query("divisor") int divisor);
+
+    // 统一响应包装
+    class ApiResponse<T> {
+        private boolean success;
+        private String message;
+        private T data;
+    }
+}
+\end{lstlisting}
+
+\subsection{会话管理}
+会话管理用 SharedPreferences 保存登录态和用户信息，App 关掉重开仍然保持登录。\texttt{createLoginSession} 在登录成功后写入，\texttt{logout} 清空全部信息。行为追踪里的 userId 也从这里取，让上报的行为能关联到具体用户。
+
+\begin{lstlisting}[language=Java, caption={登录态的本地保存}, label={code:appx-session}]
+public class SessionManager {
+    // 登录成功后写入登录态和用户信息
+    public void createLoginSession(Long userId, String username, String nickname, String email) {
+        editor.putBoolean(KEY_IS_LOGGED_IN, true);
+        editor.putLong(KEY_USER_ID, userId);
+        editor.putString(KEY_USERNAME, username);
+        editor.apply(); // 异步落盘
+    }
+
+    public boolean isLoggedIn() {
+        return preferences.getBoolean(KEY_IS_LOGGED_IN, false);
+    }
+
+    public void logout() { editor.clear(); editor.apply(); } // 登出清空
+}
+\end{lstlisting}
