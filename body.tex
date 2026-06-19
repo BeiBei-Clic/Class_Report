@@ -1,126 +1,264 @@
 \setlength{\parindent}{2em}
 
-\section{摘要}
-变异测试通过向程序注入人工故障并观察测试套件能否发现这些故障，来衡量测试质量。传统变异测试工具通常依赖固定的变异算子，例如替换算术运算符、修改条件表达式或删除语句。这类方法实现简单、结果稳定，但也存在明显局限：真实软件缺陷往往涉及错误的方法调用、错误的属性访问、事件名称误用、参数遗漏等语义层面的变化，而固定算子很难覆盖这些缺陷模式。
+% 让 listings 代码块支持中文注释
+\lstset{extendedchars=true, inputencoding=utf8,
+        commentstyle=\color{gray!70!black}\ttfamily}
 
-本文评述 Frank Tip、Jonathan Bell 和 Max Schaefer 发表在 \textit{IEEE Transactions on Software Engineering} 2025 年第 51 卷第 6 期的论文 ``LLMorpheus: Mutation Testing Using Large Language Models''。该论文提出了一种基于大语言模型的变异测试方法：先用规则在 JavaScript/TypeScript 源代码的指定 AST 位置插入 \texttt{PLACEHOLDER}，再通过提示工程让大语言模型生成可能引入缺陷的替换代码，最后借助修改版 \texttt{StrykerJS} 执行变异体并分类。实验表明，LLMorpheus 能够生成传统工具难以产生的语义型变异体，在 40 个真实缺陷案例中有 10 个完全复现了缺陷代码，另有 26 个产生了与真实缺陷相同的测试失败。该工作说明，大语言模型不仅可以用于代码生成，也可以作为一种上下文敏感的“通用变异算子”，为软件测试质量评估提供新的技术路线。
+\section{作业概述}
+本作业是软件测试与质量控制课程的移动软件测试工具体验环节，要求体验一款移动端崩溃与异常监控工具，在平台上注册应用并集成 SDK，打包后在移动终端运行，再由平台给出程序异常、崩溃和用户行为的分析报告。课程报告需要附上主要操作过程、主要源代码，以及网站测试中发现的异常或不好用的功能点。
 
-\section{引言}
-软件测试的难点之一在于判断一组测试是否真的充分。语句覆盖率、分支覆盖率等指标只能说明代码被执行过，却不能说明测试是否能够发现错误。变异测试从另一个角度衡量测试质量：如果测试套件能够杀死大量被注入故障的程序版本，就说明它对潜在缺陷较为敏感；如果大量变异体存活，则说明测试可能存在断言不足、边界覆盖不足或场景缺失等问题。
+本次体验选用腾讯 Bugly 作为移动测试工具。它是国内主流的移动应用质量监控平台，能够采集和分析 Java 崩溃、Native 崩溃、ANR 与各类运行时异常。被测对象是本课程中自行开发的旅行攻略前后台综合应用，由一个 Android 客户端和一个 Java Spring Boot 后端组成，满足作业对源代码、后台 Java 实现和前台 Android 的全部要求，也覆盖了加分项的前后台综合应用。
 
-传统变异测试建立在“称职程序员假设”和“耦合效应”之上。前者认为真实有缺陷程序通常与正确程序非常接近，后者认为复杂缺陷往往可以由若干简单缺陷组合而成。因此，传统工具使用一组有限的简单变异算子近似真实缺陷，例如将 \texttt{+} 替换为 \texttt{-}，将条件取反，或删除函数体。这一路线在实践中已被 Pitest、Major、Stryker 等工具采用，也在工业界得到应用。
+\section{被测的前后台综合应用}
+\subsection{系统架构}
+被测系统采用移动客户端加 RESTful 后端加嵌入式数据库的三层结构，整体如图~\ref{fig:arch}~所示。Android 客户端通过 Retrofit 发起 HTTP 请求与后端交互，后端基于 Spring Boot 实现，使用 H2 嵌入式数据库持久化数据，崩溃与异常数据则由集成在客户端中的 Bugly SDK 直接上报到腾讯云端。
 
-然而，随着现代软件系统复杂度提高，仅靠固定算子会遗漏许多真实缺陷。论文给出的例子很有代表性：\texttt{zip-a-folder} 的权限检查缺陷涉及属性访问表达式变化，\texttt{countries-and-timezones} 的负数处理缺陷涉及函数调用插入，\texttt{image-downloader} 的路径处理缺陷涉及方法调用替换，事件驱动程序中的缺陷还可能来自事件名错误绑定。这些变更都不是简单的运算符替换，若为每一种缺陷模式都设计专门算子，工具复杂度和执行成本都会迅速上升。
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=2pt, minimum width=2.8cm, minimum height=1cm,
+              align=center, font=\small, fill=gray!6},
+  arr/.style={->, thick, gray!70!black}]
+  \node[box] (app) at (0,0) {Android 客户端\\旅行攻略 App};
+  \node[box] (server) at (5.2,0) {Spring Boot 后端\\Java};
+  \node[box] (db) at (5.2,-2) {H2 数据库};
+  \node[box, fill=gray!12] (bugly) at (5.2,2) {腾讯 Bugly 云端\\崩溃与异常分析};
+  \draw[arr] (app) -- node[above, font=\wuhao]{HTTP / Retrofit} (server);
+  \draw[arr] (server) -- (db);
+  \draw[arr] (app) -- node[above, font=\wuhao, sloped]{SDK 上报} (bugly);
+\end{tikzpicture}
+\caption{被测前后台综合应用系统架构}
+\label{fig:arch}
+\end{figure}
 
-LLMorpheus 的研究动机正来自这一矛盾：变异测试需要更丰富、更接近真实缺陷的变异体，但传统算子集合又不能无限扩张。该论文的关键思路是把“在哪变异”和“怎样变异”分开处理。变异位置仍由规则控制，从而保持可解释性和工程可控性；变异内容则交给大语言模型，根据代码上下文生成语义合理的替换片段。这使变异测试从固定规则驱动转向规则定位与模型生成相结合。
+该系统同时承担两类被测目标。一类是后端 Java 进程在处理请求时抛出的运行时异常，由后端的 \texttt{TestExceptionController} 主动触发，再由 \texttt{GlobalExceptionHandler} 统一捕获。另一类是 Android 客户端运行时发生的崩溃，包括 Java 崩溃、Native 崩溃和 ANR，由客户端的 \texttt{CrashTester} 主动触发，再由 Bugly SDK 自动采集上报。
 
-\section{背景}
-\subsection{变异测试的基本思想}
-给定程序 $P$ 和测试套件 $T$，变异测试工具会对 $P$ 施加小规模修改，生成一组变异体 $M=\{m_1,m_2,\ldots,m_n\}$。如果某个变异体运行测试后出现测试失败，则该变异体被称为 killed；如果测试全部通过，则称为 survived；如果执行超时，则称为 timed-out。常见的变异得分可以表示为：
-\[
-MS=\frac{K}{K+S},
-\]
-其中 $K$ 表示被杀死的变异体数量，$S$ 表示存活变异体数量。分数越高，通常意味着测试套件越能区分原程序和带缺陷程序。
+\subsection{后台 Java 实现}
+后端基于 Spring Boot 3 构建。业务功能由目的地、攻略、用户等一组控制器提供，异常测试集中在 \texttt{TestExceptionController}，统一异常处理在 \texttt{GlobalExceptionHandler}，用户行为的记录与查询在 \texttt{UserBehaviorController}。数据通过 Spring Data JPA 的仓库接口持久化到 H2 数据库。
 
-存活变异体并不总是代表测试不足，因为有些变异体与原程序语义等价，任何测试都无法区分它们。这类等价变异体是变异测试长期面临的问题。一个理想的变异测试工具应当在生成足够多有意义变异体的同时，尽量减少等价变异体和无效变异体。
+后台启动后默认监听 8080 端口，并暴露 H2 数据库的 Web 控制台，方便直接查看数据。访问 \texttt{http://localhost:8080/h2-console} 即可登录数据库查看行为记录和业务数据，如图~\ref{fig:h2}~所示。
 
-\subsection{传统变异算子的局限}
-传统工具的优势在于确定性强、实现清晰、执行流程成熟，但它们通常只覆盖局部语法层面的变化。论文指出，真实缺陷并不总能映射到这些算子。例如，开发者可能调用了相似但语义不同的方法，可能漏传一个关键参数，可能把事件监听器绑定到错误事件，也可能在属性访问上使用了错误常量。这些错误与上下文关系紧密，只有理解代码意图后才容易构造。
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.82\textwidth]{figures/h2-console.png}
+\caption{后端 H2 数据库的 Web 控制台登录页}
+\label{fig:h2}
+\end{figure}
 
-如果继续沿着固定算子路线扩展，需要不断为每类语言结构和 API 模式增加新算子。这不仅增加实现负担，也会产生大量低价值变异体，拖慢测试执行。更重要的是，固定算子只能枚举研究者预先想到的错误形式，而真实缺陷空间远大于算子集合。
+\subsection{前台 Android 实现}
+Android 客户端包含登录注册、目的地列表、攻略详情、搜索、点赞等功能页面，使用 Retrofit 加 Gson 与后端通信。为支持移动端测试工具体验，客户端额外实现了两个工具类。\texttt{CrashTester} 用于主动触发各类崩溃，用来验证 SDK 的采集能力。\texttt{BehaviorTracker} 用于记录用户在 App 内的页面访问、点击、搜索等行为并异步上报后端。应用入口 \texttt{TravelGuideApplication} 中完成 Bugly SDK 的初始化。
 
-\subsection{大语言模型带来的机会}
-大语言模型在大量自然语言和代码语料上训练，具备一定的代码补全、API 使用和上下文建模能力。LLMorpheus 并没有把大语言模型直接用于生成测试，而是把它用作变异内容生成器。与基于真实缺陷训练专用模型的方法相比，这种方式不需要为每个项目收集缺陷数据和重新训练模型；与传统变异算子相比，它又可以生成更大粒度、更语义化的代码替换。
+\section{移动测试工具的集成}
+\subsection{工作模式与选型}
+移动端崩溃监控类工具的工作模式大致相同。先在平台创建应用拿到 AppId，再把 SDK 集成进客户端工程，打包出带 SDK 的安装包并在设备上运行，SDK 会自动把崩溃、异常、性能和行为数据上报回平台，最后登录网站查看分析报告。腾讯 Bugly 完整覆盖了这条链路，提供崩溃、异常、ANR 的采集与分析，以及趋势统计和告警能力，因此选作本次体验的工具。
 
-这种思路的关键风险也很明显。模型可能生成语法错误代码，可能生成与原代码等价的重写，也可能生成不稳定、不可复现的结果。因此，论文没有只提出概念，而是围绕有效变异体数量、等价变异体比例、温度参数、提示模板、模型选择、运行成本和真实缺陷模拟能力设计了系统实验。
+\subsection{SDK 集成}
+客户端通过 Gradle 引入腾讯 Bugly 的崩溃采集 SDK，依赖配置见代码~\ref{code:gradle}。随后在应用入口 \texttt{TravelGuideApplication.onCreate()} 中调用 \texttt{CrashReport.initCrashReport()} 完成初始化，见代码~\ref{code:init}。初始化的第三个参数是调试模式开关，调试模式下 SDK 会输出详细日志并加快上报，便于实验阶段快速观察采集结果。
 
-\section{方法}
-\subsection{总体框架}
-LLMorpheus 可以概括为一个三阶段流程：首先，提示生成器解析源代码，在预定义位置插入 \texttt{PLACEHOLDER}；其次，大语言模型根据带占位符的上下文和原始代码片段生成多个候选替换；最后，变异体生成器过滤无效结果，并交给修改版 \texttt{StrykerJS} 执行测试。该流程既保留传统变异测试“逐个变异并运行测试”的基本框架，也引入了 LLM 的上下文生成能力。
+\begin{lstlisting}[language=Java, caption={Bugly SDK 的 Gradle 依赖}, label={code:gradle}]
+dependencies {
+    // 腾讯 Bugly 崩溃采集 SDK
+    implementation 'com.tencent.bugly:crashreport:4.1.9.3'
+    // Retrofit 用于与后端通信
+    implementation 'com.squareup.retrofit2:retrofit:2.9.0'
+    implementation 'com.squareup.retrofit2:converter-gson:2.9.0'
+    // ...其余依赖省略
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Java, caption={Bugly SDK 的初始化代码}, label={code:init}]
+public class TravelGuideApplication extends Application {
+    private static final String BUGLY_APP_ID = "3f957d9605";
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        try {
+            // 第三个参数为调试模式开关，true 时输出详细日志并加快上报
+            CrashReport.initCrashReport(this, BUGLY_APP_ID, true);
+            Log.i("TravelGuideApp", "Bugly SDK initialized, appId=" + BUGLY_APP_ID);
+        } catch (Throwable t) {
+            Log.e("TravelGuideApp", "Bugly SDK initialization failed", t);
+        }
+    }
+}
+\end{lstlisting}
+
+\section{测试体验与实验过程}
+本节按后台 Java 异常捕获、移动端崩溃采集、用户行为分析三条线给出主要操作过程和主要源代码，对应作业要求的三类分析报告。
+
+\subsection{后台 Java 异常捕获}
+为验证工具对后台 Java 异常的捕获能力，后端实现了 \texttt{TestExceptionController}，提供一组专门用于触发各类运行时异常的 HTTP 接口。访问 \texttt{/api/test} 可以获取全部异常测试接口列表，如图~\ref{fig:api}~所示，共 7 个接口，分别对应空指针、数组越界、除零、数字格式、资源未找到、业务异常和非法参数异常。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/api-endpoints.png}
+\caption{后台 /api/test 返回的异常测试接口列表}
+\label{fig:api}
+\end{figure}
+
+各接口的触发参数和预期异常见表~\ref{tab:apis}。以空指针和除零两个接口为例，其实现见代码~\ref{code:ctrl}。当请求携带特定参数时，方法体内会故意执行会抛出异常的操作。
 
 \begin{table}[!htbp]
 \centering
 \small
-\caption{LLMorpheus 的主要模块}
-\label{tab:modules}
+\caption{后台异常测试接口一览}
+\label{tab:apis}
 \renewcommand{\arraystretch}{1.15}
-\begin{tabularx}{\textwidth}{p{3.2cm}X}
+\begin{tabularx}{\textwidth}{lXX}
 \toprule
-模块 & 作用 \\
+接口路径 & 触发参数 & 预期异常 \\
 \midrule
-Prompt Generator & 解析 JavaScript/TypeScript 源文件，基于 AST 选择变异位置，生成包含 \texttt{PLACEHOLDER} 的提示。 \\
-Mutant Generator & 从 LLM 返回结果中提取代码块，去除重复、原样返回和语法错误的候选，生成可执行的变异体列表。 \\
-Modified StrykerJS & 读取预计算变异体，运行项目测试套件，将变异体分类为 killed、survived 或 timed-out，并生成报告。 \\
+/api/test/null-pointer        & trigger=true    & NullPointerException \\
+/api/test/index-out-of-bounds & index=10        & ArrayIndexOutOfBoundsException \\
+/api/test/arithmetic          & divisor=0       & ArithmeticException \\
+/api/test/number-format       & number=abc      & NumberFormatException \\
+/api/test/resource-not-found  & id=999          & ResourceNotFoundException \\
+/api/test/business-error      & trigger=true    & BusinessException \\
+/api/test/illegal-argument    & value=-1        & IllegalArgumentException \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\subsection{变异位置选择}
-LLMorpheus 使用 BabelJS 解析 JavaScript/TypeScript 源文件，并在若干类型的 AST 节点处插入 \texttt{PLACEHOLDER}。这些位置包括 \texttt{if}、\texttt{switch}、\texttt{while}、\texttt{do-while} 的条件表达式，循环初始化器和更新器，函数调用的接收者、参数以及完整参数序列等。选择这些位置的原因是它们与真实缺陷高度相关，且局部替换后仍容易保持语法结构完整。
+\begin{lstlisting}[language=Java, caption={主动触发异常的接口节选}, label={code:ctrl}]
+@GetMapping("/null-pointer")
+public ResponseEntity<Map<String, Object>> testNullPointerException(
+        @RequestParam(required = false, defaultValue = "false") boolean trigger) {
+    if (trigger) {
+        String nullString = null;
+        int length = nullString.length(); // 抛出 NullPointerException
+    }
+    Map<String, Object> response = new HashMap<>();
+    response.put("success", true);
+    response.put("message", "没有触发异常");
+    return ResponseEntity.ok(response);
+}
 
-这一步体现了论文方法中的保守性。LLM 并不是任意改写整个文件，而是在工具指定的位置补全缺陷片段。规则负责控制搜索空间，模型负责在局部上下文内提出更丰富的替换方式。这样既降低了生成成本，也减少了完全无关或破坏程序结构的输出。
+@GetMapping("/arithmetic")
+public ResponseEntity<Map<String, Object>> testArithmeticException(
+        @RequestParam(defaultValue = "1") int divisor) {
+    int result = 100 / divisor; // divisor 为 0 时抛出 ArithmeticException
+    // ...
+}
+\end{lstlisting}
 
-\subsection{提示设计}
-默认提示模板包含四类信息：变异测试背景说明、带 \texttt{PLACEHOLDER} 的源代码片段、被替换的原始代码片段，以及要求模型生成有缺陷替换代码的指令。模型被要求为每个占位符给出最多 3 个候选，并用代码块包裹输出，便于后处理程序提取。
+这些异常由 \texttt{GlobalExceptionHandler} 统一捕获。它用 \texttt{@RestControllerAdvice} 注册一组 \texttt{@ExceptionHandler}，把异常转换成统一格式的错误响应返回给调用方，同时调用 \texttt{ex.printStackTrace()} 把完整堆栈打印到后台控制台，供测试工具或运维捕获，见代码~\ref{code:handler}。
 
-提示设计是论文的重要实验变量。作者比较了完整提示、简化系统提示、去除解释、去除详细指令、只要求一个变异和基础填空式提示等多种变体。结果显示，完整提示整体表现最好，而只要求一个变异或只做基础填空会显著减少有效变异体数量。这说明在软件工程任务中，LLM 的能力不仅来自模型本身，也强烈依赖任务描述、上下文组织和输出约束。
+\begin{lstlisting}[language=Java, caption={全局异常处理器节选}, label={code:handler}]
+@ExceptionHandler(NullPointerException.class)
+public ResponseEntity<ErrorResponse> handleNullPointerException(
+        NullPointerException ex, WebRequest request) {
+    ErrorResponse errorResponse = new ErrorResponse(
+            HttpStatus.INTERNAL_SERVER_ERROR.value(), "空指针异常",
+            "系统内部错误: " + ex.getMessage(),
+            request.getDescription(false), LocalDateTime.now());
+    ex.printStackTrace(); // 打印堆栈，供测试工具捕获
+    return new ResponseEntity<>(errorResponse, HttpStatus.INTERNAL_SERVER_ERROR);
+}
+\end{lstlisting}
 
-\subsection{变异体过滤与执行}
-LLM 的输出不能直接用于变异测试。LLMorpheus 首先用正则表达式提取 fenced code block 中的候选代码，然后过滤与原始片段完全相同的结果，去除重复候选，再用 BabelJS 检查语法合法性。通过这些检查的候选会被写入 \texttt{mutants.json}，供修改版 \texttt{StrykerJS} 使用。
+\subsection{移动端崩溃采集}
+移动端通过 \texttt{CrashTester} 在主界面菜单中弹出选择框，可以主动触发不同类型的崩溃和异常，用来验证 Bugly 的采集能力。可选类型包括自定义的空指针、数组越界、除零三类 Java 崩溃，Bugly 官方内置的 Java、Native、ANR 崩溃测试，以及主动上报已捕获异常且不导致崩溃的一种方式，见代码~\ref{code:crash}。前三类自定义崩溃没有做 try-catch，会直接导致 App 崩溃并被 Bugly 自动采集。最后一种用 \texttt{CrashReport.postCatchedException()} 上报已经被 catch 的异常，App 不会崩溃，但同样能在平台看到记录。
 
-执行阶段沿用 StrykerJS 的测试运行与报告机制。每个变异体被单独应用到源代码并运行测试套件，根据结果划分为 killed、survived 或 timed-out。这样的设计降低了工具实现风险：LLMorpheus 不需要重新实现完整的变异测试执行框架，而是把创新集中在变异体生成环节。
+\begin{lstlisting}[language=Java, caption={移动端崩溃的触发代码节选}, label={code:crash}]
+private static void triggerNullPointer() {
+    String nullStr = null;
+    int length = nullStr.length(); // 未捕获，导致崩溃，由 Bugly 采集
+}
 
-\section{实现}
-\subsection{工具实现}
-LLMorpheus 面向 JavaScript/TypeScript 生态实现，主要依赖 BabelJS、Handlebars 和 StrykerJS。BabelJS 用于构建和修改 AST，Handlebars 用于实例化提示模板，StrykerJS 则承担变异体执行、测试运行和报告生成。论文还考虑了实际工程使用中的问题，例如通过 \texttt{--rateLimit} 控制请求频率，通过 \texttt{--nrAttempts} 处理 API 限流重试，并限制提示中的源码上下文长度以控制 token 成本。
+private static void triggerArithmetic() {
+    int a = 10, b = 0;
+    int c = a / b; // 除零，触发 ArithmeticException
+}
 
-从工程角度看，该实现的价值在于“最小替换”。它没有推翻成熟的变异测试工具链，而是在现有 StrykerJS 流程前增加 LLM 生成变异体的前置阶段。这种架构使方法更容易验证，也便于与传统 StrykerJS 变异算子进行对比。
+private static void reportCaughtException() {
+    try {
+        Integer.parseInt("not_a_number");
+    } catch (Exception e) {
+        CrashReport.postCatchedException(e); // 捕获后上报，App 不崩溃
+    }
+}
+\end{lstlisting}
 
-\subsection{实验设置}
-论文在 13 个 JavaScript/TypeScript 项目上评估 LLMorpheus，并使用 5 个大语言模型：\texttt{codellama-34b-instruct}、\texttt{codellama-13b-instruct}、\texttt{llama-3.3-70b-instruct}、\texttt{mixtral-8x7b-instruct} 和 \texttt{gpt-4o-mini}。实验围绕 7 个研究问题展开，覆盖变异体数量、等价变异体比例、温度影响、提示模板影响、模型差异、运行成本和真实 bug 模拟能力。
+实验的操作过程是这样的。先启动后端 \texttt{./gradlew bootRun} 并保持运行，再用 Android Studio 把客户端安装到模拟器，依次进入主界面菜单的崩溃测试，选择不同条目触发崩溃。App 崩溃重启后，Bugly SDK 会把崩溃堆栈异步上报到云端，之后登录 Bugly 控制台即可查看采集结果。
 
-主实验使用 \texttt{codellama-34b-instruct}，温度设为 0.0。LLMorpheus 产生 9,967 个提示，最终得到 6,712 个有效变异体，其中 3,237 个被测试杀死，3,155 个存活，320 个超时。与 StrykerJS 相比，LLMorpheus 生成了更多存活变异体，说明它能够暴露传统算子不容易触及的测试薄弱点。
+\subsection{用户行为分析}
+客户端的 \texttt{BehaviorTracker} 以单例形式记录用户行为，定义了页面进入与退出、点击、搜索、分享、点赞、登录登出与注册等行为类型。每当用户执行相应操作，就调用 \texttt{trackBehavior()} 把行为类型、行为详情、页面名、会话 ID 和设备信息组装起来，通过 Retrofit 异步上报到后端的 \texttt{/api/behavior/record} 接口，见代码~\ref{code:tracker}。
+
+\begin{lstlisting}[language=Java, caption={用户行为的记录与上报节选}, label={code:tracker}]
+public void trackBehavior(String actionType, String actionDetail, String pageName) {
+    Map<String, Object> behaviorData = new HashMap<>();
+    behaviorData.put("userId", userId);
+    behaviorData.put("actionType", actionType);
+    behaviorData.put("actionDetail", actionDetail);
+    behaviorData.put("pageName", pageName);
+    behaviorData.put("sessionId", sessionId);
+    behaviorData.put("deviceInfo", getDeviceInfo());
+    // 异步上报到后端
+    apiService.recordBehavior(behaviorData).enqueue(new Callback<>() { /* ... */ });
+}
+\end{lstlisting}
+
+后端 \texttt{UserBehaviorController} 接收并持久化这些行为记录，并提供按用户、按会话、按行为类型、按时间段的查询接口。其中 \texttt{GET /api/behavior/session/\{sessionId\}} 会返回某会话内的全部行为及其页面访问顺序，对应作业要求的记录访问发掘页面顺序。
+
+\section{实验结果与分析}
+\subsection{移动端崩溃采集结果}
+登录腾讯 Bugly 控制台后，在异常概览页面可以看到本次实验触发的崩溃记录，如图~\ref{fig:crashlist}~所示。列表中每条记录包含异常编号、异常类型、发生次数、影响用户数、发生时间和异常摘要。本次实验共采集到 5 条记录，覆盖 Java 层和 Native 层两类崩溃，汇总见表~\ref{tab:crashes}。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/bugly-crash-list.png}
+\caption{腾讯 Bugly 的异常概览列表}
+\label{fig:crashlist}
+\end{figure}
 
 \begin{table}[!htbp]
 \centering
 \small
-\caption{主实验中 LLMorpheus 的变异体结果}
-\label{tab:main-results}
-\renewcommand{\arraystretch}{1.15}
-\begin{tabular}{lcc}
+\caption{Bugly 采集到的崩溃与异常记录}
+\label{tab:crashes}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{p{4.7cm}X}
 \toprule
-指标 & 数量 & 比例 \\
+异常类型 & 触发方式与异常摘要 \\
 \midrule
-有效变异体 & 6,712 & 100\% \\
-killed & 3,237 & 48.2\% \\
-survived & 3,155 & 47.0\% \\
-timed-out & 320 & 4.8\% \\
+SIGABRT & 由 \texttt{testNativeCrash()} 触发的 Native 层崩溃 \\
+RuntimeException & 由 \texttt{testJavaCrash()} 触发的官方测试崩溃 \\
+ArithmeticException & 由 \texttt{triggerArithmetic()} 触发的除零异常 \\
+ArrayIndexOutOfBoundsException & 由 \texttt{triggerArrayIndexOutOfBounds()} 触发的数组越界 \\
+NullPointerException & 由 \texttt{triggerNullPointer()} 触发，对 null 调用 \texttt{length()} \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 \end{table}
 
+点击列表中的任一条目可以进入异常详情页，查看完整的堆栈和线程信息。以 Native 崩溃 SIGABRT 为例，详情页展示了带内存偏移地址的 Native 调用栈，能定位到 \texttt{libart.so}、\texttt{libgui.so} 等系统库中的崩溃位置，如图~\ref{fig:stack}~所示。这说明 Bugly 不仅采集 Java 层异常，还能还原 Native 层崩溃，后续上传符号表后就可以把这些内存地址解析成可读的源码行号。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/bugly-stack-trace.png}
+\caption{腾讯 Bugly 的异常堆栈详情}
+\label{fig:stack}
+\end{figure}
+
 \subsection{结果分析}
-论文对存活变异体进行了人工检查。LLMorpheus 的存活变异体中约 80\% 是非等价变异体，20\% 是等价变异体；作为对比，StrykerJS 的等价变异体比例约为 5\%。这说明 LLM 生成的变异体语义更丰富，但也更容易产生等价重写，例如 \texttt{substring}、\texttt{substr} 和 \texttt{slice} 的近等价替换，或 JavaScript 中会被忽略的多余参数。
+从采集结果可以得出几点结论。第一，自定义触发的三类 Java 崩溃，也就是空指针、数组越界和除零，都被正确采集，异常类型和堆栈定位到的 \texttt{CrashTester} 方法一一对应，验证了 SDK 的崩溃捕获与堆栈还原能力。第二，Bugly 官方提供的 Java、Native、ANR 测试接口同样被记录，其中 Native 崩溃能还原出完整的系统库调用栈，说明工具具备跨 Java 层和 Native 层的采集能力。第三，\texttt{postCatchedException()} 上报的已捕获异常也出现在记录中，并且不会导致 App 崩溃，满足记录非致命异常的需求。
 
-温度实验显示，温度为 0.0 时结果最稳定；当温度升高到 0.25、0.50 和 1.0 时，总体变异体数量变化不大，但重复实验之间的一致性明显下降，尤其是温度 1.0 时几乎每次运行都会产生不同结果。模型对比实验显示，\texttt{llama-3.3-70b-instruct} 和 \texttt{codellama-34b-instruct} 通常生成最多有效变异体和存活变异体，但其他模型也能产生有用结果。
+\section{网站测试异常与不好用的功能点}
+\label{sec:anomalies}
+本节汇总使用腾讯 Bugly 过程中发现的不好用的功能点和需要注意的问题，对应作业要求中的这一项。
 
-真实缺陷案例研究是论文最有说服力的部分。作者选取 40 个真实 bug，在修复版本附近生成变异体，并比较变异体与原始 buggy 版本的测试失败情况。结果显示，LLMorpheus 在 10 个案例中生成了与真实缺陷语法完全相同的代码，在另外 26 个案例中生成了导致相同测试失败的变异体。这意味着 90\% 的真实缺陷至少可以被 LLMorpheus 以行为等价的方式模拟。对于测试质量评估而言，这比“生成很多语法变化”更重要，因为它说明生成的变异体确实接近开发者会犯的错误。
+\subsection{Native 崩溃堆栈需要符号表才能定位}
+本次实验采集到的 SIGABRT 属于 Native 层崩溃。在异常详情页可以看到，这类崩溃上报的是带内存偏移地址的调用栈，比如 \texttt{libart.so} 和 \texttt{libgui.so} 中的 pc 地址，无法直接读出函数名和源码行号。要把它解析成可读信息，需要先用 NDK 编译出带调试符号的 so 文件，再把符号表上传到 Bugly 的符号表管理页面。这意味着 Native 崩溃的定位成本明显高于 Java 崩溃，是这类工具普遍存在的使用门槛。本次实验以 Java 崩溃为主，Native 崩溃由官方测试接口触发，影响不大，但在真实项目里处理 so 崩溃时，符号表的准备和上传是不可省略的一步。
 
-\subsection{局限性}
-LLMorpheus 仍有几个局限。第一，等价变异体比例高于传统工具，会增加人工审查成本。第二，当前实现主要支持 JavaScript/TypeScript，跨语言推广还需要适配不同语言的解析器和测试框架。第三，占位符策略是预定义的，可能遗漏一些重要变异位置。第四，LLM 输出具有非确定性，即使温度为 0.0，不同模型或服务端实现也可能带来结果差异。第五，真实缺陷复现实验虽然通过多模型比较缓解了训练集泄漏疑虑，但仍难以完全排除模型见过相关代码的可能性。
+\subsection{数据上报存在延迟}
+Bugly SDK 采用缓存加批量上报的方式，不会在崩溃发生的瞬间就把数据传到云端。即使初始化时开启了调试模式来加快上报，操作完成后通常也要等几分钟，刷新控制台才能看到新的崩溃记录。实验过程中第一次触发崩溃后立即去网站查看，列表是空的，一度让人怀疑采集没有成功，实际上只是上报还没有完成。这一点在使用时需要心中有数，排查问题的时候不能因为网站暂时没有数据就否定 SDK 的工作。
 
-\section{结论}
-LLMorpheus 的核心贡献不是简单地把大语言模型接入变异测试，而是提出了一种清晰的分工方式：规则决定变异位置，LLM 生成变异内容，传统变异测试框架负责执行和评估。这个设计既利用了大语言模型对代码上下文和常见缺陷模式的建模能力，也保留了变异测试流程的可控性。
+\subsection{调试模式与发布模式需要区分}
+初始化代码里第三个参数设为 true，开启的是调试模式，会输出详细日志并加快上报，方便实验阶段观察。这个模式不适合直接带到正式发布版本，详细日志会带来额外的性能开销，也可能在日志里暴露敏感信息。正式打包前需要把这个参数改成 false，或者按 Build 类型区分。这类配置切换容易在赶进度时被忽略，属于集成时需要留意的一个功能点。
 
-实验结果表明，LLMorpheus 可以生成大量有效变异体，能够模拟许多传统 StrykerJS 算子无法覆盖的真实 bug，并且整体运行成本较低。特别是在 40 个真实缺陷案例中，36 个案例被完全或行为层面复现，说明该方法生成的变异体不只是随机代码扰动，而是具有实际测试价值的缺陷近似。
+\section{总结}
+本次作业围绕移动软件测试工具体验展开，以自研的旅行攻略前后台综合应用为被测对象，完整走通了集成 SDK、触发异常与崩溃、上报数据、登录平台查看分析报告的全流程。后台 Java 异常通过 \texttt{TestExceptionController} 和 \texttt{GlobalExceptionHandler} 触发并捕获，移动端崩溃通过 \texttt{CrashTester} 触发并由 Bugly SDK 采集，用户行为通过 \texttt{BehaviorTracker} 上报后端并支持会话级的页面访问顺序查询，三类分析报告都得到了实际数据的支撑。
 
-与此同时，论文也提醒我们不能把 LLM 生成结果直接视为可靠答案。等价变异体、语法无效候选、非确定性和语言生态限制都需要工程过滤和实验验证。LLMorpheus 的价值在于提供了一条务实路线：让 LLM 扩展传统工具的语义覆盖范围，同时用静态解析、测试执行和对比实验约束模型的不确定性。
+在腾讯 Bugly 上，作业的核心目标，也就是移动端崩溃、异常和 ANR 的采集与分析顺利达成，采集到的 Java 崩溃、Native 崩溃和已捕获异常记录都能在控制台正确还原堆栈。使用中也发现，Native 崩溃需要符号表才能定位、数据上报存在延迟、调试与发布模式需要区分，这几点是实际落地时要关注的。
 
-\section{启发}
-这篇论文给我的第一点启发是，LLM 在软件工程中的有效用法不一定是端到端替代传统工具。LLMorpheus 没有让模型独立判断测试质量，而是把模型放在最适合发挥作用的位置：根据上下文生成候选缺陷。位置选择、语法校验和测试执行仍由确定性工具完成。这种“传统框架 + LLM 局部增强”的模式比完全依赖模型更容易落地。
-
-第二点启发是，研究创新可以来自对旧流程中瓶颈环节的替换。传统变异测试的瓶颈在于固定算子表达能力不足，而不是整个变异测试思想过时。LLMorpheus 没有否定变异测试，而是把固定算子替换为上下文敏感的生成机制。这种改造思路也可以迁移到其他软件工程任务中，例如静态分析告警修复、测试断言生成、代码审查建议和缺陷定位。
-
-第三点启发是，提示工程需要被当作实验对象而不是经验技巧。论文通过不同提示模板的消融实验说明，输出格式、上下文信息和候选数量都会显著影响结果。这提示后续使用 LLM 做软件工程研究时，应系统报告 prompt 设计、模型配置、温度参数和重复实验，而不能只给出单次运行结果。
-
-最后，这项工作也留下了值得继续研究的问题。后续可以探索自动过滤等价变异体的方法，例如结合静态分析、符号执行或 LLM 自解释；也可以研究更灵活的 \texttt{PLACEHOLDER} 策略，让用户按项目特点指定变异位置；还可以把 LLMorpheus 推广到 Python、Java 等语言，并与自动测试生成工具结合，形成“生成测试--生成变异体--反馈改进测试”的闭环。总体来看，LLMorpheus 说明大语言模型可以成为软件测试基础设施的一部分，但前提是把它纳入严格、可验证、可复现的工程流程中。
+通过这次作业，我对移动端崩溃监控工具的工作模式有了直观的认识。这类工具的价值在于用嵌入 SDK 加云端聚合的方式，把分散在大量设备上的崩溃和行为数据集中成可分析、可追溯的报告，帮助开发者快速定位稳定性问题。同时也体会到，工具选型不能只看功能列表，平台的可用性比如证书维护和接口稳定性，同样是能否实际落地的关键前提。
