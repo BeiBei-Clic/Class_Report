@@ -36,7 +36,20 @@
 \subsection{后台 Java 实现}
 后端基于 Spring Boot 3 构建。业务功能由目的地、攻略、用户等一组控制器提供，异常测试集中在 \texttt{TestExceptionController}，统一异常处理在 \texttt{GlobalExceptionHandler}，用户行为的记录与查询在 \texttt{UserBehaviorController}。数据通过 Spring Data JPA 的仓库接口持久化到 H2 数据库。
 
-后台启动后默认监听 8080 端口，并暴露 H2 数据库的 Web 控制台，方便直接查看数据。访问 \texttt{http://localhost:8080/h2-console} 即可登录数据库查看行为记录和业务数据，如图~\ref{fig:h2}~所示。
+后台启动后默认监听 8080 端口。在 \texttt{demo/} 目录执行 \texttt{./gradlew bootRun} 启动后端，控制台输出的关键日志见代码~\ref{code:boot}。Spring Boot 3.4.4 在 Java 17 上完成 Spring Data JPA 仓库扫描、内嵌 Tomcat 绑定 8080 端口、H2 控制台就绪，整个应用在约 1.5 秒内启动完成。
+
+\begin{lstlisting}[caption={后端 Spring Boot 启动日志节选}, label={code:boot}]
+:: Spring Boot ::                (v3.4.4)
+Starting DemoApplication using Java 17.0.18 with PID 35427
+Running with Spring Boot v3.4.4, Spring v6.2.5
+Finished Spring Data repository scanning in 21 ms. Found 4 JPA repository interfaces.
+Tomcat initialized with port 8080 (http)
+H2 console available at '/h2-console'. Database available at 'jdbc:h2:file:./data/travel-guide'
+Tomcat started on port 8080 (http) with context path '/'
+Started DemoApplication in 1.508 seconds (process running for 1.621)
+\end{lstlisting}
+
+启动成功后，后端还暴露 H2 数据库的 Web 控制台，方便直接查看数据。访问 \texttt{http://localhost:8080/h2-console} 即可登录数据库查看行为记录和业务数据，如图~\ref{fig:h2}~所示。
 
 \begin{figure}[!htbp]
 \centering
@@ -157,6 +170,65 @@ public ResponseEntity<ErrorResponse> handleNullPointerException(
 }
 \end{lstlisting}
 
+在浏览器依次访问表~\ref{tab:apis}~中的 7 个接口，\texttt{GlobalExceptionHandler} 都按预期捕获了异常，并通过 \texttt{printStackTrace()} 把完整堆栈打印到后端控制台。以空指针接口为例，真实捕获到的完整堆栈见代码~\ref{code:tracenpe}：堆栈顶层精确定位到 \texttt{TestExceptionController.testNullPointerException} 的第 30 行，其下依次是反射调用、Spring MVC 的 \texttt{DispatcherServlet} 和内嵌 Tomcat 的 \texttt{CoyoteAdapter}，是异常从业务代码抛出、经框架层层传递、最终被统一处理器捕获的完整调用链。
+
+\begin{lstlisting}[caption={空指针接口真实捕获的完整异常堆栈}, label={code:tracenpe}]
+触发接口：GET /api/test/null-pointer?trigger=true    HTTP 500
+java.lang.NullPointerException: Cannot invoke "String.length()" because "nullString" is null
+	at com.example.demo.controller.TestExceptionController.testNullPointerException(TestExceptionController.java:30)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:569)
+	at org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:258)
+	at org.springframework.web.method.support.InvocableHandlerMethod.invokeForRequest(InvocableHandlerMethod.java:191)
+	at org.springframework.web.servlet.mvc.method.annotation.ServletInvocableHandlerMethod.invokeAndHandle(ServletInvocableHandlerMethod.java:118)
+	at org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter.handleInternal(RequestMappingHandlerAdapter.java:891)
+	at org.springframework.web.servlet.mvc.method.AbstractHandlerMethodAdapter.handle(AbstractHandlerMethodAdapter.java:87)
+	at org.springframework.web.servlet.DispatcherServlet.doDispatch(DispatcherServlet.java:1089)
+	at org.springframework.web.servlet.DispatcherServlet.doService(DispatcherServlet.java:979)
+	at org.springframework.web.servlet.FrameworkServlet.doGet(FrameworkServlet.java:903)
+	at jakarta.servlet.http.HttpServlet.service(HttpServlet.java:564)
+	at org.apache.catalina.core.ApplicationFilterChain.internalDoFilter(ApplicationFilterChain.java:195)
+	at org.apache.catalina.core.ApplicationFilterChain.doFilter(ApplicationFilterChain.java:140)
+	at org.springframework.web.filter.RequestContextFilter.doFilterInternal(RequestContextFilter.java:100)
+	at org.springframework.web.filter.OncePerRequestFilter.doFilter(OncePerRequestFilter.java:116)
+	at org.springframework.web.filter.CharacterEncodingFilter.doFilterInternal(CharacterEncodingFilter.java:201)
+	at org.apache.catalina.core.StandardWrapperValve.invoke(StandardWrapperValve.java:167)
+	at org.apache.catalina.core.StandardContextValve.invoke(StandardContextValve.java:90)
+	at org.apache.catalina.core.StandardHostValve.invoke(StandardHostValve.java:115)
+	at org.apache.catalina.valves.ErrorReportValve.invoke(ErrorReportValve.java:93)
+	at org.apache.catalina.connector.CoyoteAdapter.service(CoyoteAdapter.java:344)
+	at org.apache.coyote.http11.Http11Processor.service(Http11Processor.java:397)
+	at org.apache.tomcat.util.net.NioEndpoint$SocketProcessor.doRun(NioEndpoint.java:1743)
+	at org.apache.tomcat.util.net.SocketProcessorBase.run(SocketProcessorBase.java:52)
+	at org.apache.tomcat.util.threads.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1190)
+	at java.base/java.lang.Thread.run(Thread.java:840)
+\end{lstlisting}
+
+7 个接口的实际捕获结果汇总见表~\ref{tab:traces}，堆栈顶层都能定位到 \texttt{TestExceptionController} 的具体方法与行号，与表~\ref{tab:apis}~的预期一一对应。其中值得说明的是异常 4：访问 \texttt{/api/test/number-format} 传入非数字 \texttt{abc} 时，\texttt{TestExceptionController} 内部先把 \texttt{NumberFormatException} 捕获并包装成 \texttt{BusinessException} 再抛出，因此堆栈顶层是 \texttt{BusinessException}，根本原因 \texttt{NumberFormatException} 出现在 cause 链中。与此对应，未捕获的运行时异常返回 HTTP 500，业务异常和参数异常返回 HTTP 400，资源未找到返回 HTTP 404，状态码语义清晰。
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{7 个异常测试接口的实际捕获结果}
+\label{tab:traces}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{lclX}
+\toprule
+触发接口 & HTTP & 定位行 & 实际异常类型 \\
+\midrule
+/api/test/null-pointer        & 500 & :30  & NullPointerException \\
+/api/test/index-out-of-bounds & 500 & :51  & ArrayIndexOutOfBoundsException \\
+/api/test/arithmetic          & 500 & :68  & ArithmeticException \\
+/api/test/number-format       & 400 & :91  & BusinessException（由 NumberFormatException 包装） \\
+/api/test/business-error      & 400 & :122 & BusinessException \\
+/api/test/illegal-argument    & 400 & :140 & IllegalArgumentException \\
+/api/test/resource-not-found  & 404 & :104 & ResourceNotFoundException \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
 \subsection{移动端崩溃采集}
 移动端通过 \texttt{CrashTester} 在主界面菜单中弹出选择框，可以主动触发不同类型的崩溃和异常，用来验证 Bugly 的采集能力。可选类型包括自定义的空指针、数组越界、除零三类 Java 崩溃，Bugly 官方内置的 Java、Native、ANR 崩溃测试，以及主动上报已捕获异常且不导致崩溃的一种方式，见代码~\ref{code:crash}。前三类自定义崩溃没有做 try-catch，会直接导致 App 崩溃并被 Bugly 自动采集。最后一种用 \texttt{CrashReport.postCatchedException()} 上报已经被 catch 的异常，App 不会崩溃，但同样能在平台看到记录。
 
@@ -182,6 +254,27 @@ private static void reportCaughtException() {
 
 实验的操作过程是这样的。先启动后端 \texttt{./gradlew bootRun} 并保持运行，再用 Android Studio 把客户端安装到模拟器，依次进入主界面菜单的崩溃测试，选择不同条目触发崩溃。App 崩溃重启后，Bugly SDK 会把崩溃堆栈异步上报到云端，之后登录 Bugly 控制台即可查看采集结果。
 
+从客户端侧看，用 \texttt{adb logcat} 过滤 \texttt{CrashReport} 关键字，可以观察到 Bugly SDK 的完整工作过程，关键日志见代码~\ref{code:logcat}。App 启动时 SDK 完成初始化并下载到云端策略，打印版本号 \texttt{v4.1.9.3} 和 AppId；触发崩溃后，SDK 异步起一个上传线程把数据发往 \texttt{https://android.bugly.qq.com/rqd/async}，日志里出现 \texttt{response code 200} 和 \texttt{Success: crash}，是崩溃数据成功送达腾讯服务器的直接证据，与下一节在 Bugly 控制台看到的记录互为印证。
+
+\begin{lstlisting}[caption={Bugly SDK 初始化与崩溃上报的 logcat 节选}, label={code:logcat}]
+# 1. App 启动时 SDK 初始化（打印版本号与 AppId，证明集成成功）
+I CrashReportInfo: [init] Open debug mode of Bugly.
+I CrashReport:     [init] Bugly complete version: v4.1.9.3
+I CrashReportInfo: [init] Bugly initialization finished.
+I TravelGuideApp:  Bugly SDK initialized, appId=3f957d9605
+I CrashReport:     [Strategy] enableCrashReport:true, enableAnr:true, enableSession:true ...
+
+# 2. 触发崩溃后，SDK 起异步线程把数据上传到腾讯服务器
+I CrashReport: [UploadManager] Create and start a new thread to execute a upload task: BUGLY_ASYNC_UPLOAD
+D CrashReport: [Upload] Send 581 bytes
+D CrashReport: [Upload] Upload to https://android.bugly.qq.com/rqd/async?aid=102e8... with cmd 840
+
+# 3. 上传成功的直接证据（HTTP 200 + Success）
+D CrashReport: response code 200
+D CrashReport: [Upload] Status from server is 0
+I CrashReport: [Upload] Success: crash
+\end{lstlisting}
+
 \subsection{用户行为分析}
 客户端的 \texttt{BehaviorTracker} 以单例形式记录用户行为，定义了页面进入与退出、点击、搜索、分享、点赞、登录登出与注册等行为类型。每当用户执行相应操作，就调用 \texttt{trackBehavior()} 把行为类型、行为详情、页面名、会话 ID 和设备信息组装起来，通过 Retrofit 异步上报到后端的 \texttt{/api/behavior/record} 接口，见代码~\ref{code:tracker}。
 
@@ -200,6 +293,55 @@ public void trackBehavior(String actionType, String actionDetail, String pageNam
 \end{lstlisting}
 
 后端 \texttt{UserBehaviorController} 接收并持久化这些行为记录，并提供按用户、按会话、按行为类型、按时间段的查询接口。其中 \texttt{GET /api/behavior/session/\{sessionId\}} 会返回某会话内的全部行为及其页面访问顺序，对应作业要求的记录访问发掘页面顺序。
+
+在 App 内完成一次登录、浏览目的地、查看攻略、搜索、点赞、分享后，访问 \texttt{GET /api/behavior/session/XYH\_20260619\_234235}，接口返回的 JSON 见代码~\ref{code:behavior}（节选）。\texttt{behaviors} 数组按时间顺序记录了本次会话的全部 19 条行为，每条包含行为类型、行为详情、页面名和会话 ID；\texttt{pageSequence} 字段则由后端从全部行为里筛出页面进入记录拼接而成，直接给出可读的访问路径。
+
+\begin{lstlisting}[caption={用户行为查询接口返回的 JSON 节选}, label={code:behavior}]
+请求：GET http://localhost:8080/api/behavior/session/XYH_20260619_234235
+{
+  "success": true,
+  "behaviors": [
+    { "actionType": "APP_START",  "pageName": "启动页",              "actionDetail": "应用启动" },
+    { "actionType": "LOGIN",      "pageName": "登录页",              "actionDetail": "用户登录成功" },
+    { "actionType": "PAGE_ENTER", "pageName": "目的地列表",          "actionDetail": "进入目的地列表" },
+    { "actionType": "CLICK",      "pageName": "目的地列表",          "actionDetail": "点击目的地：北京" },
+    { "actionType": "PAGE_ENTER", "pageName": "目的地详情-北京",     "actionDetail": "进入目的地详情" },
+    { "actionType": "PAGE_ENTER", "pageName": "攻略详情-北京三日游", "actionDetail": "进入攻略详情" },
+    { "actionType": "LIKE",       "pageName": "攻略详情",            "actionDetail": "点赞攻略：北京三日游" },
+    { "actionType": "SEARCH",     "pageName": "搜索页",              "actionDetail": "搜索关键词：上海" },
+    { "actionType": "SHARE",      "pageName": "目的地详情-上海",     "actionDetail": "分享目的地：上海" },
+    { "actionType": "APP_EXIT",   "pageName": "主页",                "actionDetail": "用户退出应用" }
+    // 其余行为已省略，本次会话共 19 条
+  ],
+  "pageSequence": "目的地列表 -> 目的地详情-北京 -> 攻略详情-北京三日游 -> 目的地列表 -> 搜索页 -> 搜索结果-上海 -> 目的地详情-上海 -> 目的地列表"
+}
+\end{lstlisting}
+
+本次会话记录的行为类型分布见表~\ref{tab:behavior}。这次会话覆盖了启动、登录、浏览、点击、点赞、搜索、分享、退出共 8 种行为类型和 8 类页面，后端按 \texttt{sessionId} 把同一会话内的行为聚合成有序访问路径 \texttt{pageSequence}，可用于漏斗分析、用户路径分析和页面停留分析，对应作业要求的记录访问发掘页面顺序。
+
+\begin{table}[!htbp]
+\centering
+\small
+\caption{本次会话记录的用户行为类型分布}
+\label{tab:behavior}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{lXc}
+\toprule
+行为类型 & 含义 & 次数 \\
+\midrule
+APP\_START  & 应用启动 & 1 \\
+LOGIN       & 登录     & 1 \\
+PAGE\_ENTER & 进入页面 & 7 \\
+CLICK       & 点击     & 5 \\
+LIKE        & 点赞     & 1 \\
+SEARCH      & 搜索     & 1 \\
+SHARE       & 分享     & 1 \\
+APP\_EXIT   & 退出应用 & 1 \\
+\midrule
+\multicolumn{2}{l}{合计：8 种行为类型，涉及 8 类页面} & 19 \\
+\bottomrule
+\end{tabularx}
+\end{table}
 
 \section{实验结果与分析}
 \subsection{移动端崩溃采集结果}
@@ -255,6 +397,11 @@ Bugly SDK 采用缓存加批量上报的方式，不会在崩溃发生的瞬间�
 
 \subsection{调试模式与发布模式需要区分}
 初始化代码里第三个参数设为 true，开启的是调试模式，会输出详细日志并加快上报，方便实验阶段观察。这个模式不适合直接带到正式发布版本，详细日志会带来额外的性能开销，也可能在日志里暴露敏感信息。正式打包前需要把这个参数改成 false，或者按 Build 类型区分。这类配置切换容易在赶进度时被忽略，属于集成时需要留意的一个功能点。
+
+\subsection{用户行为上报的会话聚合缺陷}
+在验证用户行为分析时，发现并修复了一个后端缺陷：后端的 \texttt{UserBehaviorController}.\allowbreak\texttt{recordBehavior()} 原先强制使用 HTTP 请求自身的会话 ID，也就是 \texttt{request.getSession()}.\allowbreak\texttt{getId()}，作为每条行为记录的 sessionId。但 App 端的 \texttt{BehaviorTracker} 已经在本地生成会话 ID 并随行为一起上报，后端却把它丢弃了。结果是同一用户在一次使用中上报的多条行为，被后端当成来自不同会话的独立请求，4.3 节的 \texttt{pageSequence} 拼出来是断的，无法还原真实的页面跳转顺序。
+
+排查后把 \texttt{recordBehavior} 改为优先使用客户端上报的 sessionId，只有客户端未提供时才回退到 HTTP 会话。修复后，同一会话内的行为才能正确聚合成一条完整的访问路径，4.3 节展示的 \texttt{pageSequence} 正是修复后的结果。这个缺陷的隐蔽之处在于它既不报错、数据也都在，只是会话聚合错了，只有拿着 \texttt{pageSequence} 和实际操作步骤逐一对照才能发现，属于测试用户行为分析功能时容易漏掉的问题。
 
 \section{总结}
 本次作业围绕移动软件测试工具体验展开，以自研的旅行攻略前后台综合应用为被测对象，完整走通了集成 SDK、触发异常与崩溃、上报数据、登录平台查看分析报告的全流程。后台 Java 异常通过 \texttt{TestExceptionController} 和 \texttt{GlobalExceptionHandler} 触发并捕获，移动端崩溃通过 \texttt{CrashTester} 触发并由 Bugly SDK 采集，用户行为通过 \texttt{BehaviorTracker} 上报后端并支持会话级的页面访问顺序查询，三类分析报告都得到了实际数据的支撑。
