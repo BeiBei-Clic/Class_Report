@@ -13,7 +13,7 @@
 \titleformat{\subsection}{\bf\normalsize}{\thesubsection\hspace{0.4em}}{0.2em}{}
 
 % ====== 摘要 ======
-\noindent\hspace{2em}本教学案例记录作者参加 Kaggle Track 1 LLM Operator Development and Optimization 竞赛的工程实践，使用 OpenAI Triton 语言为 FlagGems 开源 GPU 算子库开发高性能深度学习算子。案例对象是大语言模型推理与训练中频繁调用的 20 个算子，难度分为基础逐元素运算、卷积池化与损失算子，以及线性代数分解、序列损失、空间插值、线性注意力融合三档。文中分析 Triton 的 Block 级 SPMD 编程抽象与 MLIR/LLVM 编译流水线，梳理 FlagGems 的 \texttt{libentry}、\texttt{pointwise\_dynamic} 与运行时配置体系，以 \texttt{log10}、\texttt{max\_pool3d}、\texttt{upsample\_nearest2d}、\texttt{conv\_transpose2d}、\texttt{svd}、\texttt{chunk\_gated\_delta\_rule} 等算子为例，讨论逐点模板生成、Tile 并行索引、反向传播散射与基于 \texttt{autotune} 的软流水调优。交付的 20 个算子通过 2871 项功能测试且无一失败，多数算子相对 PyTorch 原生实现取得 $1.0\times$ 至 $2.8\times$ 的设备端加速，部分融合算子加速比超过 $15\times$。
+\noindent\hspace{2em}本案例记录 Kaggle Track 1 LLM Operator Development and Optimization 竞赛的工程实践，使用 OpenAI Triton 语言为 FlagGems 开源 GPU 算子库开发高性能深度学习算子。案例对象是大语言模型推理与训练中频繁调用的 20 个算子，难度分为基础逐元素运算、卷积池化与损失算子，以及线性代数分解、序列损失、空间插值、线性注意力融合三档。文中分析 Triton 的 Block 级 SPMD 编程抽象与 MLIR/LLVM 编译流水线，梳理 FlagGems 的 \texttt{libentry}、\texttt{pointwise\_dynamic} 与运行时配置体系，以 \texttt{log10}、\texttt{max\_pool3d}、\texttt{upsample\_nearest2d}、\texttt{conv\_transpose2d}、\texttt{svd}、\texttt{chunk\_gated\_delta\_rule} 等算子为例，讨论逐点模板生成、Tile 并行索引、反向传播散射与基于 \texttt{autotune} 的软流水调优。交付的 20 个算子通过 2871 项功能测试且无一失败，多数算子相对 PyTorch 原生实现取得 $1.0\times$ 至 $2.8\times$ 的设备端加速，部分融合算子加速比超过 $15\times$。本工作的竞赛提交对应 FlagGems 仓库 Pull Request \#3460，见 \url{https://github.com/flagos-ai/FlagGems/pull/3460}。
 
 \reportpart{理论基础与核心概念}
 
