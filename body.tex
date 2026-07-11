@@ -1,128 +1,1119 @@
 \setlength{\parindent}{2em}
 
-\section{Paper Information}
-This report reviews the paper ``Learning Soft Sparse Shapes for Efficient Time-Series Classification.'' The paper revisits shapelet-based time-series classification and proposes a softer alternative to the usual hard-filtering strategy. Rather than discarding low-scoring candidate subsequences outright, it keeps strong ones individually and fuses weak ones into a weighted representation. I chose this paper because it tackles a real bottleneck in shapelet methods---the crude way they prune candidates---instead of layering on complexity for its own sake. Table \ref{tab:meta} summarizes the bibliographic details.
+% ====== 中文章节编号重定义：第X部分 / 一、二、 / 1.1 ======
+\newcounter{reportpart}
+\newcommand{\reportpart}[1]{%
+  \stepcounter{reportpart}%
+  \vspace{0.9em}%
+  \noindent{\large\bf\color{blue!55!black} 第\xCJKnumber{\arabic{reportpart}}部分\hspace{0.6em}#1}\vspace{0.3em}\par%
+}
+\renewcommand{\thesection}{\xCJKnumber{\arabic{section}}}
+\renewcommand{\thesubsection}{\arabic{section}.\arabic{subsection}}
+\titleformat{\section}{\bf\normalsize}{\thesection、}{0.5em}{}
+\titleformat{\subsection}{\bf\normalsize}{\thesubsection\hspace{0.4em}}{0.2em}{}
+
+% ====== 摘要 ======
+\noindent\hspace{2em}本教学案例记录作者参加 Kaggle Track 1 LLM Operator Development and Optimization 竞赛的工程实践，使用 OpenAI Triton 语言为 FlagGems 开源 GPU 算子库开发高性能深度学习算子。案例对象是大语言模型推理与训练中频繁调用的 20 个算子，难度分为基础逐元素运算、卷积池化与损失算子，以及线性代数分解、序列损失、空间插值、线性注意力融合三档。文中分析 Triton 的 Block 级 SPMD 编程抽象与 MLIR/LLVM 编译流水线，梳理 FlagGems 的 \texttt{libentry}、\texttt{pointwise\_dynamic} 与运行时配置体系，以 \texttt{log10}、\texttt{max\_pool3d}、\texttt{upsample\_nearest2d}、\texttt{conv\_transpose2d}、\texttt{svd}、\texttt{chunk\_gated\_delta\_rule} 等算子为例，讨论逐点模板生成、Tile 并行索引、反向传播散射与基于 \texttt{autotune} 的软流水调优。交付的 20 个算子通过 2871 项功能测试且无一失败，多数算子相对 PyTorch 原生实现取得 $1.0\times$ 至 $2.8\times$ 的设备端加速，部分融合算子加速比超过 $15\times$。
+
+\reportpart{理论基础与核心概念}
+
+\noindent\hspace{2em}本部分为算子开发实践建立理论基础。第 1.1 节说明 GPU 算子性能为何成为深度学习系统的关键瓶颈，第 1.2 节讨论 GPU 的硬件特征与并行优化难点，第 1.3 节介绍 Triton 语言的编程抽象与编译流水线，第 1.4 节梳理 Triton 的核心接口，第 1.5 节分析 FlagGems 算子库的架构与算子分类。
+
+\section{大模型时代的高效算子开发需求}
+
+\subsection{LLM 推理与算子性能瓶颈}
+随着大语言模型规模从数亿参数扩展至数千亿，推理与训练的计算成本急剧上升。一次前向传播中，仅注意力机制就涉及 softmax 归一化、掩码、缩放点积、dropout 等十余种逐元素或归约算子，前馈层还包含矩阵乘法、层归一化、激活函数与残差连接。若这些算子逐一调用通用的 PyTorch eager 实现，中间张量会在 GPU 显存与寄存器之间反复搬运，带来巨大的内存带宽开销，即内存墙问题。
+
+算子性能取决于两个核心指标。计算密度指每字节搬运完成的浮点运算数 FLOPs/Byte，Roofline 上界由峰值算力与显存带宽共同决定。逐元素算子如 \texttt{log10}、\texttt{cosh} 计算密度极低，性能完全受限于显存带宽，理想实现应使有效带宽逼近硬件峰值。归约与矩阵类算子如 \texttt{median}、卷积、SVD 存在计算与访存的混合瓶颈，需要通过分块与数据复用提升计算密度。判断算子属于何种瓶颈，是制定优化策略的前提。
+
+\subsection{GPU 计算特征与并行优化挑战}
+现代 GPU 如 NVIDIA Hopper/Ada 架构以 SIMT 单指令多线程方式执行程序，内存层次自上而下分为寄存器、共享内存与 L1 缓存、L2 缓存、全局显存、主机内存，容量递增而延迟递增（图~\ref{fig:mem}）。高效算子应让数据驻留在靠近计算单元的存储层级，并通过合并访问减少对全局显存的访问次数。
+
+直接用 CUDA C/C++ 编写达到上述目标的算子并不容易，开发者需要手动管理线程块划分、共享内存分配、bank conflict 规避、双缓冲流水线，以及冗长的模板代码。这套底层细节对深度学习研究者构成显著门槛。Triton 语言的出发点正是在保留接近手写 CUDA 性能的同时，把编程抽象提升到块一级。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[scale=0.9, every node/.style={font=\small}]
+\def\dy{0.62}
+% 5 层内存（上小下大，表示容量递增、延迟递增）
+\fill[red!25, draw=red!60!black] (-1.0,4*\dy) rectangle (1.0,5*\dy);
+\node[font=\scriptsize] at (0,4.5*\dy) {寄存器};
+\fill[orange!30, draw=orange!70!black] (-1.6,3*\dy) rectangle (1.6,4*\dy);
+\node[font=\scriptsize] at (0,3.5*\dy) {共享内存 / L1};
+\fill[yellow!35, draw=yellow!70!black] (-2.4,2*\dy) rectangle (2.4,3*\dy);
+\node[font=\scriptsize] at (0,2.5*\dy) {L2 缓存};
+\fill[blue!25, draw=blue!60!black] (-3.4,1*\dy) rectangle (3.4,2*\dy);
+\node[font=\scriptsize] at (0,1.5*\dy) {全局显存 (HBM)};
+\fill[gray!25, draw=gray!60!black] (-4.4,0*\dy) rectangle (4.4,1*\dy);
+\node[font=\scriptsize] at (0,0.5*\dy) {主机内存 (CPU)};
+% 右侧标注
+\node[anchor=west, font=\scriptsize] at (4.6,4.5*\dy) {$\sim$256KB/SM, 1 周期};
+\node[anchor=west, font=\scriptsize] at (4.6,3.5*\dy) {$\sim$200KB/SM, $\sim$30 周期};
+\node[anchor=west, font=\scriptsize] at (4.6,2.5*\dy) {全设备共享, $\sim$200 周期};
+\node[anchor=west, font=\scriptsize] at (4.6,1.5*\dy) {40--80\,GB, $\sim$400 周期};
+\node[anchor=west, font=\scriptsize] at (4.6,0.5*\dy) {需 PCIe 传输};
+% 左侧轴
+\draw[<->, thick] (-5.0,0)--(-5.0,5*\dy);
+\node[rotate=90, font=\scriptsize] at (-5.35,2.5*\dy) {容量递增 / 延迟递增};
+\end{tikzpicture}
+\caption{GPU 的内存层次：越靠近计算单元容量越小、延迟越低，算子优化的核心是让数据驻留在高层}
+\label{fig:mem}
+\end{figure}
+
+\subsection{Triton 语言：面向深度学习的 GPU DSL}
+Triton 由 OpenAI 提出，是一种嵌入在 Python 中的领域专用语言。程序员以数据块而非单个线程为单位书写运算，编译器自动完成线程块内的并行映射、共享内存分配、数据复用与内存访问合并。相比 CUDA，Triton 的代码量通常减少一个数量级。相比 PyTorch 的高层算子，Triton 允许把多个操作融合到一个 kernel 中，避免中间结果落盘显存。表~\ref{tab:triton-vs} 对比了三种开发方式的取舍。
 
 \begin{table}[!htbp]
-\centering
-\small
-\caption{Basic information of the reviewed paper}
-\label{tab:meta}
+\centering\small
+\caption{CUDA、Triton 与 PyTorch eager 三种算子开发方式的对比}
+\label{tab:triton-vs}
 \renewcommand{\arraystretch}{1.15}
-\begin{tabularx}{\textwidth}{p{2.6cm}X}
+\begin{tabularx}{\textwidth}{lXXX}
 \toprule
-Item & Content \\
+维度 & CUDA C/C++ & Triton (DSL) & PyTorch eager \\
 \midrule
-Title & Learning Soft Sparse Shapes for Efficient Time-Series Classification \\
-Authors & Zhen Liu, Yicheng Luo, Boyuan Li, Emadeldeen Eldele, Min Wu, and Qianli Ma \\
-Venue & Proceedings of the 42nd International Conference on Machine Learning (ICML 2025) \\
-Vol./No. & Proceedings of Machine Learning Research, Vol.~267; no separate issue number \\
-Pages & 39032--39059 \\
-Year & 2025 \\
-Research Topic & Efficient and interpretable time-series classification with soft sparse shape learning \\
+编程抽象 & 单线程 + 手动同步 & 数据块级 SPMD & 整张量级 \\
+性能上限 & 最高（可极致调优） & 接近手写 CUDA & 受内存墙限制大 \\
+开发效率 & 低（模板冗长） & 高（Python 语法） & 最高 \\
+算子融合 & 完全可控 & 完全可控 & 不支持（需 torch.compile） \\
+代码量 & 大 & 小 & 极小（调用 API） \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-The authors are from South China University of Technology and A*STAR. The timing is right for this kind of work. Deep models for time series keep getting more accurate, but most of them remain opaque about why they make a decision. Shapelet methods have always been interpretable, but the classical pipeline relies on hard pruning---keep a few candidates, throw away the rest. The authors try to keep the interpretability while fixing the pruning step, using ideas from sparse routing and mixture-of-experts. That connection between classical representations and newer mechanisms is what drew me to the paper.
+正因如此，FlagGems 选择 Triton 作为其算子实现的唯一编程语言，并要求所有社区贡献也以纯 Triton 形式提交。
 
-\section{Background}
-\subsection{Problem Setting}
-Time-series classification shows up everywhere: activity recognition from wearables, ECG diagnosis, equipment monitoring, finance, traffic prediction. Deep learning has pushed accuracy on these tasks, but the models are hard to interpret. In practice, knowing the predicted label is often not enough---you also need to know which temporal patterns drove the decision. An accurate but opaque model is a liability when the output informs real choices.
+\section{深入解析 Triton 编程模型}
 
-Shapelet-based methods take a different approach. A shapelet is a short subsequence that captures a local pattern characteristic of a class. Because the model's decision is tied to specific subsequences, a domain expert can inspect the selected shapelets and check whether the model is attending to the right signals. Shapelets are an explanation interface, not merely a feature extraction trick.
+\subsection{Block 级抽象与 SPMD 编程模型}
+Triton 的执行模型是单程序多数据 SPMD。程序员书写一份作用于一个程序实例的函数，GPU 上每个线程块运行一个程序实例。函数内部通过 \texttt{tl.arange(0, BLOCK\_SIZE)} 声明编译期固定大小的块级向量，对该向量的运算会被映射到线程块内数十至数百个线程上并行执行。
 
-\subsection{Limitations of Existing Methods}
-The bottleneck in shapelet learning is efficiency. A long time series contains a huge number of candidate subsequences, and evaluating all of them is expensive. Most methods cope by applying hard sparsification: rank the candidates, keep the top few, discard the rest. This works, but it throws away information. Low-scoring shapes may still carry useful signal, and a binary keep-or-discard decision cannot capture degrees of relevance. The hard filter creates a bottleneck before the model has had a chance to learn the global class structure.
+例如，对一个长度为 $N$ 的一维张量做逐元素 $y=x^2$，Triton 的写法是：
+\begin{lstlisting}[language=Python]
+@triton.jit
+def square_kernel(x_ptr, y_ptr, N, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)              # 当前程序实例的编号
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(x_ptr + offs, mask=mask)  # 从全局内存载入一个块
+    y = x * x
+    tl.store(y_ptr + offs, y, mask=mask)  # 写回结果
+\end{lstlisting}
+编译器自动完成三件事，把 \texttt{BLOCK} 个元素的载入合并为若干次 128 字节的对齐事务，把乘法映射到线程束内的并行指令，处理边界掩码以支持非整除长度。程序员无需关心线程索引、共享内存或同步原语。
 
-SoftShape replaces this hard filter with a soft one. Strong shapes stay as individual embeddings; weak shapes are fused into a single weighted vector. The pipeline shifts from hard selection to soft compression. What I find clever is that the change is small---it only affects how you handle the low-scoring candidates---but it ripples through the rest of the design. The compression rule turns out to matter more than the representation itself.
+\subsection{Triton 编译流水线：从 Python 到 PTX}
+Triton 程序的编译经过图~\ref{fig:pipeline} 所示的多级中间表示。Python 函数在 \texttt{@triton.jit} 装饰下被解析为抽象语法树并特化为基于 MLIR dialect 的 Triton IR，经死代码消除、循环不变量外提、块级数据流分析等优化 Pass 转化为 LLVM IR，再由 LLVM 后端生成 NVIDIA PTX，最终由驱动编译为本机 SASS 码。整个流水线对程序员透明，关键在于 MLIR 提供了结构化的高层中间表示，使分块、广播、归约等张量级操作可在编译期被全局优化，Triton 性能因而接近手写 CUDA。
 
-\section{Method}
-\subsection{Overall Framework}
-The model works in three stages. Sliding windows extract overlapping subsequences from the input, and a one-dimensional convolutional layer maps each to a shape embedding. A soft sparsification step then scores each shape by classification contribution: high-scoring shapes are kept individually, low-scoring shapes are fused. Finally, a soft shape learning block processes the sparsified set, learning both patterns within each shape and dependencies across shapes before classification.
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.5cm,
+  box/.style={draw, rounded corners=2pt, minimum height=0.95cm, minimum width=2.0cm, align=center, font=\small, fill=blue!6},
+  arr/.style={-{Stealth[length=2.2mm]}, thick, draw=gray!70},
+  lab/.style={font=\scriptsize\itshape, text=gray!60!black}]
+\node[box] (py) {Python\\ \scriptsize \texttt{@triton.jit}};
+\node[box, right=of py] (tir) {Triton IR\\\scriptsize (MLIR dialect)};
+\node[box, right=of tir] (lir) {LLVM IR};
+\node[box, right=of lir] (ptx) {PTX};
+\node[box, right=of ptx] (sass) {SASS\\\scriptsize (GPU 二进制)};
+\draw[arr] (py) -- (tir);
+\draw[arr] (tir) -- (lir);
+\draw[arr] (lir) -- (ptx);
+\draw[arr] (ptx) -- (sass);
+\node[lab, below=0.05cm of py] {前端};
+\node[lab, below=0.05cm of tir] {块级优化};
+\node[lab, below=0.05cm of lir] {标量优化};
+\node[lab, below=0.05cm of ptx] { ISA};
+\node[lab, below=0.05cm of sass] {执行};
+\end{tikzpicture}
+\caption{Triton 的多级编译流水线：Python DSL 经 MLIR/LLVM 降到 GPU 原生指令}
+\label{fig:pipeline}
+\end{figure}
 
-The design keeps the local-pattern perspective of shapelet methods while adding soft weighting and expert routing. What I like is that the authors do not throw out the original inductive bias of shapelets---the idea that local subsequences carry discriminative information---but ask how that bias can survive inside a more expressive system. That tends to work better than starting from scratch.
+\subsection{核心编程接口：jit、autotune 与 heuristics}
+Triton 提供三个对算子开发至关重要的装饰器。
 
-\subsection{Soft Shape Sparsification}
-The model extracts shape embeddings $\hat{S}_{n,p}^{m}$ from sliding windows of length $m$ and step size $q$. A gated attention mechanism estimates each shape's contribution score:
-\[
-\alpha(\hat{S}_{n,p}^{m})=\sigma\!\left(W_2\tanh\!\left(W_1\hat{S}_{n,p}^{m}+b_1\right)+b_2\right).
-\]
-Rather than using the score for hard pruning, it creates soft representations. For top-ranked shapes:
-\[
-S_{e,n,p}^{m}=\alpha(\hat{S}_{n,p}^{m})\hat{S}_{n,p}^{m},
-\]
-and for low-scoring shapes, the model fuses them into a single weighted embedding:
-\[
-S_{e,n,\mathrm{fused}}^{m}=\sum_{p\in E}\alpha(\hat{S}_{n,p}^{m})\hat{S}_{n,p}^{m},
-\]
-where $E$ denotes the index set of shapes below the threshold. The key effect is that important local patterns stay visible as separate shapes, while weak ones still contribute through the fused term. Computation drops, but nothing gets cut off entirely.
+\begin{itemize}\tightlist
+\item \texttt{@triton.jit} 即时编译装饰器，将 Python 函数特化为 GPU kernel。参数中标注 \texttt{tl.constexpr} 的为编译期常量，不同取值生成不同特化版本。
+\item \texttt{@triton.autotune} 自动调优装饰器。对同一 kernel 预先给出多组配置，包括块大小、\texttt{num\_warps}、\texttt{num\_stages}，编译器在首次运行时逐一实测，为每组输入形状选择最快配置并缓存。本案例在 \texttt{max\_pool3d} 反向优化中大量使用该机制。
+\item \texttt{@triton.heuristics} 启发式配置装饰器，根据输入张量形状在编译期推导合理常量，例如小空间维度时复用 \texttt{SAME\_H} 分支，减少通用代码路径。
+\end{itemize}
 
-This is the core methodological idea, in my view. Compression becomes differentiable: the model learns how much to keep. In earlier shapelet methods, sparsification means ``remove as much as possible without hurting performance too much.'' In SoftShape, sparsification means ``redistribute information into a smaller but still expressive representation.'' That shift in what sparsification means is what makes the idea transferable to other pipelines that face a similar keep-or-discard choice.
+三者的典型组合是 \texttt{heuristics} $\rightarrow$ \texttt{autotune} $\rightarrow$ \texttt{jit}，FlagGems 几乎所有非逐点算子都遵循这一装饰顺序。
 
-\subsection{Soft Shape Learning Block}
-After sparsification, a learning block with two branches processes the shapes. The intra-shape branch models temporal patterns inside each soft shape. The inter-shape branch treats the sparsified shapes as a shorter sequence and models dependencies among them.
+\subsection{FlagGems 算子库与生态}
+FlagGems 由智源研究院发起，是 FlagOS 体系中的开源 GPU 算子库，定位为 NVIDIA CUB/cuDNN 的纯 Triton 替代。它实现了 PyTorch ATen 算子集的子集，用户调用 \texttt{flag\_gems.enable\_gems()} 后，PyTorch 的 dispatch 机制把对应算子路由到 Triton kernel，而非默认的 cuDNN/cuBLAS 实现。这使得 FlagGems 能在昇腾、寒武纪、海光等国产 GPU 上提供与 NVIDIA 等价的算子能力，是软硬协同生态的重要组成部分。本案例的工作是为该库贡献 20 个 Triton 算子实现及测试。
 
-For intra-shape learning, the paper uses a mixture-of-experts router. Given a soft shape, the routing function is
-\[
-G(S_{e,n,p}^{m})=\mathrm{TOP}_k\!\left(\mathrm{softmax}(W_t S_{e,n,p}^{m})\right),
-\]
-which activates a small number of class-related experts, letting the model specialize in discriminative local patterns. Because mixture-of-experts designs tend to collapse onto a few experts, the paper adds balancing regularization and defines the training objective as
-\[
-L_{\mathrm{total}}=L_{\mathrm{ce}}+\lambda\left(L_{\mathrm{imp}}+L_{\mathrm{load}}\right).
-\]
-The extra terms push experts toward more even usage alongside the classification loss.
+\section{FlagGems 算子库架构分析}
 
-For inter-shape learning, a shared expert network rearranges the sparsified shapes into a sequence and applies an Inception-style convolutional module to learn global dependencies. A single local pattern may be discriminative, but the relationships among several local patterns carry additional class information. What I found insightful here is that interpretability does not require limiting the model to isolated local decisions. A model can stay interpretable while reasoning over relations among its interpretable local units.
+\subsection{核心基础设施：libentry 与 pointwise\_dynamic}
+FlagGems 在原生 Triton 之上构建两层基础设施，使新增算子可以高度复用，见图~\ref{fig:arch}。
 
-The two branches answer different questions---what pattern exists inside a shape, and how multiple shapes combine into a class pattern. SoftShape's contribution is the combination of soft compression with this two-level learning. The pipeline holds together well: soft sparsification handles compression, the mixture-of-experts block learns local class-related patterns, and the shared expert captures global dependencies.
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[
+  layer/.style={draw, rounded corners=3pt, minimum width=11cm, minimum height=0.75cm, align=center, font=\small},
+  hint/.style={font=\scriptsize, text=gray!60!black}]
+\node[layer, fill=blue!8] (py) {\textbf{用户代码}：\texttt{torch.log10(x)} / \texttt{F.max\_pool3d(...)}};
+\node[layer, fill=blue!14, below=0.18cm of py] (disp) {\textbf{PyTorch Dispatcher} \quad$\xrightarrow{\texttt{enable\_gems()}}$\quad 路由到 Triton 后端};
+\node[layer, fill=blue!20, below=0.18cm of disp] (cfg) {\textbf{\texttt{\_FULL\_CONFIG}} 注册表：（算子名, 实现函数, autograd 后向）};
+\node[layer, fill=green!12, below=0.18cm of cfg, minimum height=1.1cm] (infra) {\textbf{基础设施层}\\\scriptsize \texttt{libentry}（注册/缓存） \quad \texttt{pointwise\_dynamic}（逐点代码生成） \quad \texttt{runtime}（硬件配置）};
+\node[layer, fill=orange!14, below=0.18cm of infra, minimum height=1.1cm] (ker) {\textbf{Triton kernel 层}\\\scriptsize \texttt{@triton.jit} + \texttt{@triton.autotune} + \texttt{@triton.heuristics}};
+\node[layer, fill=gray!14, below=0.18cm of ker] (gpu) {\textbf{GPU}：经 MLIR/LLVM 编译为 PTX/SASS 执行};
+\end{tikzpicture}
+\caption{FlagGems 的分层架构：用户调用经 dispatcher 进入 \texttt{\_FULL\_CONFIG}，再由基础设施层调度到具体 Triton kernel}
+\label{fig:arch}
+\end{figure}
 
-\subsection{Methodological Inspirations}
-Three things from this paper stuck with me. Whenever a model uses a selective mechanism (pruning, filtering, attention), it is worth asking whether the selection really needs to be hard---soft aggregation often works better. Interpretable units and high-capacity models can coexist; SoftShape keeps interpretable local shapes while still using modern routing and expert specialization. And local evidence needs global context. Many interpretable models explain local cues well but ignore how those cues interact, which defeats the purpose when class boundaries depend on the arrangement of fragments rather than any single fragment.
+\texttt{libentry} 是所有顶层 kernel 的统一入口装饰器，封装了 \texttt{@triton.jit}，额外提供跨进程的 autotune 缓存持久化、设备上下文自动管理 \texttt{with torch\_device\_fn.device(...)}，以及调试日志。所有非逐点算子的 kernel 都应以 \texttt{@libentry()} 而非裸 \texttt{@triton.jit} 包装。
 
-\section{Results}
-\subsection{Experimental Setting}
-The paper evaluates SoftShape on 128 datasets from the UCR time-series archive. To get more stable estimates, the authors merge the original training and test splits and rebuild them under five-fold cross-validation. Baselines include deep models (InceptionTime, TimesNet, ModernTCN, TSLANet), patch-based and Transformer-based methods (TST, PatchTST), and non-deep-learning classifiers such as ROCKET and MiniRocket. This mix of black-box and classical methods makes the comparison fairly comprehensive.
+\texttt{pointwise\_dynamic} 是代码生成器。对逐元素算子，开发者只需书写一个返回标量表达式的 \texttt{jit} 子函数，\texttt{pointwise\_dynamic} 自动处理多维广播、类型提升 \texttt{promotion\_methods}、输出写入与 grid 划分。像 \texttt{log10} 这样的算子实现只需 4 行核心代码，见代码~\ref{code:log10}。本案例的 8 个简单算子全部基于该机制。
 
-\subsection{Main Results}
-Table \ref{tab:result-main} shows representative results. SoftShape leads on all three metrics: average accuracy, average rank, and number of wins.
+\texttt{runtime} 模块封装硬件相关的调优配置，通过 \texttt{runtime.get\_tuned\_config("op\_name")} 为中等与复杂算子返回适配当前设备的 \texttt{autotune} 配置，做到一份代码多硬件可调。
+
+\subsection{算子分类与计算特征}
+本案例的 20 个算子按计算模式归为五大类，计算特征与核心技术见表~\ref{tab:op-class}。这一分类既是后续章节的组织线索，也决定每个算子的优化思路。
 
 \begin{table}[!htbp]
-\centering
-\small
-\caption{Representative comparison of the main results}
-\label{tab:result-main}
-\renewcommand{\arraystretch}{1.1}
-\begin{tabular}{lccc}
+\centering\small
+\caption{20 个算子的计算模式分类与核心技术}
+\label{tab:op-class}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{lXX}
 \toprule
-Method & Average Accuracy & Average Rank & Number of Wins \\
+计算模式 & 算子 & 核心技术 \\
 \midrule
-InceptionTime & 0.9181 & 4.05 & 29 \\
-TSLANet & 0.9205 & 3.68 & 31 \\
-SoftShape & \textbf{0.9334} & \textbf{2.72} & \textbf{53} \\
+逐元素 & log10, logaddexp, cosh, asinh, gcd, leaky\_relu & \texttt{pointwise\_dynamic} 代码生成 \\
+布局/索引 & tril, roll, scatter\_reduce, pixel\_shuffle & 索引重映射 + 掩码 \\
+归约 & median & 分块归约 + 二次全局合并 \\
+卷积/池化 & conv\_transpose2d, avg\_pool3d, max\_pool3d & Tile 并行 + \texttt{autotune} \\
+上采样/插值 & upsample\_nearest2d, grid\_sample & 坐标映射 + 反向散射 \\
+损失 & smooth\_l1\_loss, ctc\_loss & 条件分支 + 动态规划 \\
+线性代数 & svd & Jacobi 旋转并行化 \\
+融合 & chunk\_gated\_delta\_rule & 块状递推融合 (FLA) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{LLM 推理场景中的关键算子}
+这些算子并非孤立存在，而是 LLM 推理路径上的高频节点。\texttt{logaddexp} 与 \texttt{log\_softmax} 同源，用于注意力权重的对数域计算。\texttt{smooth\_l1\_loss} 与 \texttt{ctc\_loss} 是训练阶段的核心损失。\texttt{grid\_sample} 用于检索增强生成中的空间对齐与数据增强。\texttt{svd} 服务于模型压缩与低秩适配 LoRA。\texttt{chunk\_gated\_delta\_rule} 是线性注意力与门控 DeltaNet 的核心融合算子，直接决定这类高效注意力变体的推理吞吐。理解算子的场景价值，有助于在性能与精度之间做出权衡。
+
+\reportpart{实践指南：20 个 Triton 算子开发与优化}
+
+\noindent\hspace{2em}本部分把第一部分的理论付诸实践。先搭建开发与测试环境，建立可复用的工程流程，再按基础逐点、中等复杂度、困难场景的顺序逐一剖析 20 个算子的实现，重点在分块策略、反向传播设计与自动调优，最后给出全量测试与性能基准结果。
+
+\section{开发环境与工程方法}
+
+\subsection{硬件与软件栈配置}
+算子开发在 NVIDIA CUDA 12.8 平台上进行，软件栈严格对齐 FlagGems v5.0.2 在 \texttt{pyproject.toml} 中锁定的版本，见表~\ref{tab:env}。版本一致性至关重要，Triton 3.6.0 的 API 如 \texttt{tl.constexpr}、\texttt{@triton.autotune} 与 2.x 差异显著，\texttt{libentry.py} 中存在 2.x 与 3.x 的分支逻辑，混用会导致难以定位的编译错误。代码~\ref{code:setup} 给出从零搭建开发环境的命令序列。
+
+\begin{lstlisting}[language=bash, caption={开发环境搭建与验证命令}, label={code:setup}]
+# 1. 克隆 FlagGems 并切换到 v5.0.2
+git clone https://github.com/flagos-ai/FlagGems.git
+cd FlagGems && git checkout v5.0.2
+
+# 2. 创建 Python 3.12 虚拟环境并安装依赖（NVIDIA 平台 + 测试）
+uv pip install -e ".[nvidia,test]"   # 锁定 torch==2.10.0+cu128, triton==3.6.0
+
+# 3. 安装代码风格钩子（black 23.7.0 / isort 5.12.0 / flake8）
+pre-commit install
+
+# 4. 验证安装：启用 Triton 后端跑单个算子测试
+python -c "import flag_gems; flag_gems.enable_gems()"
+pytest tests/test_log10.py -v
+
+# 5. 运行性能基准（以 PyTorch 为参考计算加速比）
+python benchmark/bench_log10.py
+\end{lstlisting}
+
+\begin{table}[!htbp]
+\centering\small
+\caption{开发环境版本配置}
+\label{tab:env}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{lll}
+\toprule
+组件 & 版本 & 说明 \\
+\midrule
+Python & 3.12 (cp312) & torch 2.10 仅有 cp312 wheel \\
+PyTorch & 2.10.0+cu128 & 算子接口对齐基准 \\
+Triton & 3.6.0 & FlagGems NVIDIA 配置锁定 \\
+CUDA Toolkit & 12.8 & 对应 cuDNN 9 \\
+FlagGems & 5.0.2 & 贡献目标仓库 \\
+pytest & 9.0.3 & 功能测试框架 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-SoftShape improves average accuracy by roughly 1.29 percentage points over TSLANet and 1.53 over InceptionTime, with statistically significant gains. On a benchmark as heavily studied as UCR 128, a consistent gap of this size is hard to ignore. The numbers line up with the paper's hypothesis: the subsequences that earlier methods discard still carry class information when you represent them softly.
+\subsection{开发-测试-性能验证工作流}
+每个算子的开发遵循实现、注册、功能测试、性能基准、代码风格五步流程，见图~\ref{fig:workflow}。功能测试以 \texttt{flag\_gems.testing.gems\_assert\_close} 为断言核心，按数据类型自动选择容差，float16 为 \texttt{rtol=1e-3}，float32 为 \texttt{1.3e-6}，bfloat16 为 \texttt{0.016}。性能基准由 FlagGems 内置的 \texttt{benchmark/} 模块驱动，以 PyTorch 原生实现为参考计算设备端加速比，竞赛要求常规形状下加速比 $\geqslant 0.9\times$。加速比通过 Triton 的 \texttt{do\_bench} 函数测量，它先用若干次 warmup 稳定 GPU 频率，再用 CUDA event 计时多次取中位数，避免异步启动与频率波动干扰，核心逻辑见代码~\ref{code:bench}。
 
-The paper also shows interpretable visualizations. Hard shapelet selection highlights a few isolated segments; SoftShape instead produces soft discriminative regions with graded shading, where darker regions mean stronger contribution. The model can express that some regions matter more than others, rather than issuing a binary keep-or-discard verdict.
+\begin{lstlisting}[language=Python, caption={do\_bench 性能测量核心逻辑（Triton 标准）}, label={code:bench}]
+def do_bench(fn, warmup=25, rep=100):
+    for _ in range(warmup):          # 预热，稳定 GPU 频率
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end   = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):             # 重复执行取平均
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / rep   # 返回单次平均耗时(ms)
+\end{lstlisting}
 
-\subsection{Ablation and Analysis}
-The ablation numbers are clear. Removing soft sparsification drops average accuracy to 0.9123. Removing intra-shape learning drops it to 0.9245. Removing inter-shape learning drops it to 0.9022. Removing both learning branches brings it down to 0.8696. The biggest hit comes from removing inter-shape learning, which tells us that local discriminative fragments alone are insufficient---what often separates classes is how those fragments are arranged relative to each other.
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.35cm,
+  s/.style={draw, rounded corners=2pt, minimum height=0.7cm, minimum width=2.3cm, align=center, font=\small, fill=blue!6},
+  arr/.style={-{Stealth[length=2mm]}, thick, draw=gray!70}]
+\node[s] (a) {算子实现\\\scriptsize \texttt{ops/*.py}};
+\node[s, right=of a] (b) {注册\\\scriptsize \texttt{\_FULL\_CONFIG}};
+\node[s, right=of b] (c) {功能测试\\\scriptsize \texttt{tests/*.py}};
+\node[s, right=of c] (d) {性能基准\\\scriptsize \texttt{benchmark/}};
+\node[s, right=of d] (e) {代码风格\\\scriptsize pre-commit};
+\draw[arr] (a)--(b); \draw[arr] (b)--(c); \draw[arr] (c)--(d); \draw[arr] (d)--(e);
+\draw[arr, dashed] (e.south) to[bend left=30] node[below, font=\scriptsize]{迭代} (a.south);
+\end{tikzpicture}
+\caption{单算子开发的五步工作流}
+\label{fig:workflow}
+\end{figure}
 
-The sparse-ratio analysis shows that performance stays around 0.945 when sparsity is at or below 50\%, but drops to 0.9323 and 0.9261 at 70\% and 90\%. Soft sparsification works well, but over-compression still damages the global temporal structure among shapes. Compress too much, and even an interpretable representation stops being useful for recognition.
+\subsection{算子注册与 enable\_gems 机制}
+算子实现后，必须在 \texttt{src/flag\_gems/\_\_init\_\_.py} 的 \texttt{\_FULL\_CONFIG} 元组中注册，才能被 \texttt{enable\_gems()} 拦截。注册条目是一个三元组 \texttt{(算子全名, 实现函数, autograd\_key)}。本案例为 \texttt{chunk\_gated\_delta\_rule} 新增的注册条目为
+\begin{lstlisting}[language=Python]
+("chunk_gated_delta_rule", chunk_gated_delta_rule),
+\end{lstlisting}
+带反向传播的算子如 \texttt{conv\_transpose2d} 则需同时注册前向与后向。
+\begin{lstlisting}[language=Python]
+("conv_transpose2d", conv_transpose2d),
+("conv_transpose2d_backward", conv_transpose2d_backward),
+\end{lstlisting}
+注册表完整覆盖 20 个算子共 30 余个变体，含 \texttt{\_}、\texttt{.out} 等原地与带输出参数版本，是竞赛评审算子是否真正可用的硬性检查项。
 
-What I like about SoftShape is that it fixes a real weakness in existing shapelet pipelines instead of proposing an unnecessarily complex new formulation. Soft sparsification handles compression, the mixture-of-experts block learns local class-related patterns, and the shared expert captures global dependencies. The experiments cover the right things: main comparisons, ablations, sparsity analysis, and interpretability examples.
+\section{基础 Pointwise 算子开发}
 
-That said, the paper has gaps. Most experiments use UCR datasets, many of which are univariate, so generalization to multivariate settings remains open. The method depends on several hyperparameters (shape length, sparsity ratio, number of experts). And although the model is more interpretable than black-box alternatives, its explanations are still model-based and may need additional visualization support for domain users. The paper also focuses on empirical effectiveness; the theoretical properties of soft shape aggregation (what temporal invariances are preserved or weakened after fusion) are left unexplored.
+\subsection{pointwise\_dynamic 模板：以 log10 为例}
+\texttt{log10} 是最简单的逐元素算子，实现集中体现 \texttt{pointwise\_dynamic} 的威力。由换底公式 $\log_{10} x = \ln x \times 0.43429\ldots$，核心 kernel 只需一行表达式。
 
-\section{Research Inspirations}
-What I found most useful about this paper is how it thinks about research design. Representation learning and explanation do not have to be separate steps---SoftShape builds interpretability into the representation itself. ``Softening'' a rigid operation is often a productive move. Hard selection, hard assignment, and hard thresholding are common in classical pipelines, and replacing them with continuous, learnable alternatives tends to improve optimization. Local motifs need context; in many recognition tasks, the meaning of a local pattern depends on what surrounds it.
+\begin{lstlisting}[language=Python, caption={log10 算子的 pointwise\_dynamic 实现（code/ops/log10.py）}, label={code:log10}]
+@pointwise_dynamic(promotion_methods=[(0, "INT_TO_FLOAT")])
+@triton.jit
+def log10_func(x):
+    return tl.log(x.to(tl.float32)) * 0.4342944819032518
 
-There are a few directions I would like to see explored next. SoftShape could be adapted for multivariate time-series classification, where each shape would need to encode both temporal and channel-wise dependencies. Its shape representations could be initialized from foundation-model-style pretraining on large unlabeled time-series corpora. And the soft sparsification principle might carry over to weakly supervised learning, anomaly detection, or early classification---all settings where discarding information early is costly.
+def log10(A):
+    return log10_func(A)
 
-\section{Conclusion}
-SoftShape addresses a concrete problem in shapelet-based time-series classification: hard filtering throws away too much information. By replacing hard pruning with soft sparsification and combining local expert learning with global shape-sequence modeling, the authors build a method that is both more accurate and more interpretable than earlier shapelet approaches.
+def log10_(A):              # 原地变体
+    return log10_func(A, out0=A)
 
-What I take away from this paper is less about the architecture itself and more about the research move behind it. The authors spotted the most restrictive assumption in the existing paradigm---that candidates must be either kept or discarded---and replaced it with a learnable soft mechanism. That kind of targeted revision, swapping a rigid discrete rule for a continuous alternative, strikes me as a good way to modernize an interpretable model family without losing what made it interpretable in the first place.
+def log10_out(A, out):      # 带 out 参数变体
+    return log10_func(A, out0=out)
+\end{lstlisting}
+
+这里有三处关键设计。\texttt{promotion\_methods=[(0, "INT\_TO\_FLOAT")]} 声明第 0 个输入若为整数则提升为浮点，保证 \texttt{log10} 作用于整数张量时正确返回浮点结果，类型提升交给框架，避免手写分支。\texttt{tl.log} 内部以 \texttt{float32} 计算自然对数再乘常数 $1/\ln 10$，比直接调用 \texttt{libdevice.log10} 更利于向量化。三个变体 \texttt{log10}、\texttt{log10\_}、\texttt{log10.out} 复用同一个 \texttt{jit} 子函数，仅通过 \texttt{out0=} 参数区分输出目标，体现一份 kernel 服务多个 ATen 变体的复用范式。
+
+\subsection{类型提升与广播：logaddexp、cosh、asinh}
+双目逐点算子 \texttt{logaddexp}$(x,y) = \log(e^x + e^y)$ 的数值稳定形式为 $\max(x,y) + \log_2(1 + e^{-|x-y|}) \cdot \ln 2$，涉及两个输入的类型提升与广播。借助 \texttt{pointwise\_dynamic}，其实现依然简洁：
+\begin{lstlisting}[language=Python]
+@pointwise_dynamic(promotion_methods=[(0, 1, "BOOL_TO_LONG")])
+@triton.jit
+def logaddexp(x, y):
+    return tl.log(tl.exp(x.to(tl.float32)) + tl.exp(y.to(tl.float32)))
+\end{lstlisting}
+\texttt{cosh}、\texttt{asinh} 等双曲函数同理，区别仅在 \texttt{promotion\_methods} 的选择。本案例为 \texttt{logaddexp} 与 \texttt{asinh} 补充了四类关键测试，覆盖特殊值如 $\pm\infty$、NaN、$\pm 0$，空张量如 \texttt{(0,)} 与 \texttt{(4,0)}，非连续内存即 \texttt{transpose} 后的视图，以及广播维度。这些恰是逐点算子最易出错而 PyTorch 原生实现必须严格对齐的场景。
+
+\subsection{整数与索引算子：gcd、tril、roll、LeakyReLU}
+并非所有简单算子都适合 \texttt{pointwise\_dynamic}。\texttt{gcd} 是整数算子，需要位级精确，欧几里得辗转相除存在数据依赖，难以向量化。FlagGems 采用 Stein 二进制 GCD 算法，利用提取公因子 2 与奇数化规则把迭代转化为位运算，借助 \texttt{libdevice.ffs} 计算末尾零个数 ctz 来一次性移除所有因子 2，大幅减少迭代次数。底层整数辅助函数见代码~\ref{code:gcd}。32 位绝对值必须转无符号再取反，以避免 \texttt{INT\_MIN} 溢出，这是 GPU 整数算子常见的陷阱。
+
+\begin{lstlisting}[language=Python, caption={gcd 的 Stein 算法底层辅助函数（code/ops/gcd.py，节选）}, label={code:gcd}]
+import triton.language.extra.libdevice as libdevice
+
+@triton.jit
+def _ctz(x):                  # 末尾连续 0 的个数，用于一次性移除因子 2
+    return libdevice.ffs(x) - 1
+
+@triton.jit
+def _abs_u32(x):              # 32 位安全绝对值（避免 INT_MIN 溢出）
+    ux = x.to(tl.uint32)
+    return tl.where(x < 0, 0 - ux, ux)
+\end{lstlisting}
+
+\texttt{tril} 与 \texttt{roll} 是布局与索引算子，本质是坐标重映射。\texttt{tril} 比较行列下标生成掩码置零上三角，\texttt{roll} 对轴上偏移取模实现循环移位。LeakyReLU 作为分段逐点函数 $f(x)=x$ 若 $x>0$ 否则 $\alpha x$，用 \texttt{tl.where} 即可。LeakyReLU 形式虽简，FlagGems 并未对其使用 \texttt{pointwise\_dynamic}，而是手写 kernel 并配备按张量规模分档的 \texttt{autotune} 配置，小张量不超过 32K 元素时用 \texttt{BLOCK\_SIZE=256} 配 4 warp，大张量在 4M 至 16M 元素时用 \texttt{BLOCK\_SIZE=2048} 配更高 \texttt{num\_stages}。即便是访存受限的算子，让块大小匹配张量规模以接近带宽峰值，仍能带来可观收益。本案例为 LeakyReLU 补充了不同负斜率 $\alpha=0, 0.01, 0.5, 1.0, 0.99$ 与特殊值测试，覆盖 \texttt{INT\_TO\_FLOAT} 与 \texttt{BOOL\_TO\_LONG} 两类类型提升边界。
+
+\subsection{测试体系构建}
+算子功能正确性的验证依赖一套统一的测试范式。FlagGems 的测试以 \texttt{flag\_gems.testing.accuracy\_utils} 为基础，对每个算子按形状、数据类型、参数组合做笛卡尔积参数化，先在参考设备上计算期望值，参考设备为 CPU 或上游实现，再在 \texttt{flag\_gems.use\_gems()} 上下文中调用 Triton 实现，最后用 \texttt{gems\_assert\_close} 比对。代码~\ref{code:test} 展示 \texttt{logaddexp} 的典型测试。
+
+\begin{lstlisting}[language=Python, caption={逐点算子的典型测试范式（code/tests/test\_logaddexp.py，节选）}, label={code:test}]
+@pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_logaddexp(shape, dtype):
+    x = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    y = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    ref_x = utils.to_reference(x, True)     # 迁移到参考设备
+    ref_y = utils.to_reference(y, True)
+    ref_out = torch.logaddexp(ref_x, ref_y) # 期望值
+    with flag_gems.use_gems():              # 启用 Triton 后端
+        res_out = torch.logaddexp(x, y)
+    utils.gems_assert_close(res_out, ref_out, dtype)  # 按类型容差断言
+
+@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
+def test_logaddexp_special_values(dtype):
+    # 覆盖 +inf/-inf/NaN/+0/-0 等特殊值
+    x = torch.tensor([0.0, -0.0, 1.0, float("inf"), float("nan")], ...)
+    ...
+    utils.gems_assert_close(res_out, ref_out, dtype, equal_nan=True)
+\end{lstlisting}
+
+容差体系是精度验证的核心。\texttt{gems\_assert\_close} 依据数据类型自动选择相对容差 \texttt{rtol}，见表~\ref{tab:tol}，而非用统一的 \texttt{assert}。这一设计承认不同精度格式的舍入特性，bfloat16 因仅 7 位尾数容差最宽为 $0.016$，float32 最严为 $1.3\times10^{-6}$。本案例补充测试时严格遵守该体系，并为含 NaN 的场景启用 \texttt{equal\_nan=True}。
+
+\begin{table}[!htbp]
+\centering\small
+\caption{gems\_assert\_close 按数据类型的相对容差体系}
+\label{tab:tol}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{lcc}
+\toprule
+数据类型 & 相对容差 rtol & 典型用途 \\
+\midrule
+float32 & $1.3\times 10^{-6}$ & 高精度基准 \\
+float16 & $1\times 10^{-3}$ & 推理主力 \\
+bfloat16 & $0.016$ & LLM 训练/推理 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这 8 个简单算子合计 969 项功能测试全部通过，常规形状下加速比为 $0.8\times$ 至 $2.78\times$，详见图~\ref{fig:p1bench}。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.92\textwidth, height=5.8cm,
+  ybar, bar width=7pt,
+  enlarge x limits=0.12,
+  ylabel={相对 PyTorch 加速比}, ylabel style={font=\small},
+  symbolic x coords={log10,logaddexp,cosh,asinh,gcd,tril,leaky},
+  xtick=data,
+  x tick label style={font=\small, rotate=20, anchor=east},
+  ymin=0, ymax=3.1,
+  legend style={at={(0.5,1.02)}, anchor=south, legend columns=2, font=\small, draw=none},
+  nodes near coords style={font=\tiny},
+  ]
+\addplot[fill=blue!35, draw=blue!60!black] coordinates {(log10,0.80) (logaddexp,0.86) (cosh,0.83) (asinh,0.66) (gcd,1.19) (tril,1.01) (leaky,0.89)};
+\addplot[fill=orange!55, draw=orange!80!black] coordinates {(log10,1.25) (logaddexp,1.50) (cosh,1.25) (asinh,1.21) (gcd,1.77) (tril,2.78) (leaky,1.21)};
+\draw[dashed, red!70!black, thick] (axis cs:log10,0.9) -- (axis cs:leaky,0.9);
+\node[font=\tiny, red!70!black, anchor=west] at (axis cs:leaky,0.95) {$0.9\times$ 阈值};
+\legend{最小加速比, 最大加速比}
+\end{axis}
+\end{tikzpicture}
+\caption{8 个简单算子在多形状下的加速比区间（969 项测试全部通过）}
+\label{fig:p1bench}
+\end{figure}
+
+\section{中等复杂度算子与反向传播实现}
+
+\subsection{归约算子：median}
+\texttt{median} 是典型的全局归约算子，难点在于求中位数需要对局部数据排序，这与求和、最大值等满足结合律的归约不同，无法直接用树形归约并行化。求和归约可以写成 $(((a+b)+c)+d)$ 的线性结合，任意交换结合顺序结果不变，因此可用二叉树形归约在 $\log N$ 步内完成。中位数依赖数据的全局次序，任何分块都只是近似。
+
+FlagGems 采用分块排序加全局合并的策略，每个线程块对落入自身的子序列做局部排序并求局部中位数，再在块间做二次全局归约。该策略在分布均匀的数据上接近真实中位数，对偏态分布可能存在偏差，是以精度换并行度的典型取舍。由于中位数不满足结合律，测试中需对非连续张量与布尔张量额外对齐，确保沿指定维的 \texttt{median.dim} 与全局 \texttt{median} 的语义一致。本案例确认其已有测试覆盖完整，未做实现修改。
+
+\subsection{索引重排算子：scatter\_reduce 与 pixel\_shuffle}
+\texttt{scatter\_reduce} 是典型的按索引散射并归约的算子。给定输入 \texttt{src}、索引 \texttt{index} 与输出 \texttt{out}，对每个索引位置执行 \texttt{out[index] = reduction(out[index], src)}。它支持 \texttt{sum}、\texttt{prod}、\texttt{mean}、\texttt{amax}、\texttt{amin} 五种归约，各自对应不同原子原语。\texttt{sum} 用 \texttt{tl.atomic\_add}，\texttt{amax} 与 \texttt{amin} 用 \texttt{tl.atomic\_max} 与 \texttt{tl.atomic\_min}。\texttt{prod} 因乘法对零敏感，\texttt{mean} 需先累加再除以计数，实现上需额外计数缓冲。由于多个线程可能向同一输出位置写入，原子操作是正确性的唯一保障，但也会带来热点位置串行化，当大量索引指向同一目标时性能下降，这是该算子固有的复杂度。
+
+\texttt{pixel\_shuffle} 是确定性的坐标重排，将通道维 $(C r^2, H, W)$ 重排为 $(C, Hr, Wr)$。索引映射为，输出位置 $(c, h\cdot r+i, w\cdot r+j)$ 取自输入 $(c\cdot r^2 + i\cdot r + j, h, w)$，本质是一次 stride 的重解释。由于无数据竞争，它无需原子操作，核心难点在非连续输入的步长推导。本案例为二者补充了非连续张量与多缩放因子的测试，确保 \texttt{contiguous()} 调用与步长推导的正确性。
+
+\subsection{损失算子：smooth\_l1\_loss}
+Smooth L1 Loss（Huber Loss）定义为分段函数：
+\[
+\ell(x, y) = \begin{cases} 0.5 (x-y)^2 / \beta, & |x-y| < \beta \\ |x-y| - 0.5\beta, & \text{否则} \end{cases},
+\]
+其中 $\beta$ 为阈值。该算子用 \texttt{tl.where} 实现分段，需同时提供前向与反向，反向同样分段，梯度为 $(x-y)/\beta$ 或 $\operatorname{sign}(x-y)$。前向 kernel 实现见代码~\ref{code:smooth}，$\beta$ 被声明为 \texttt{tl.constexpr}，\texttt{if beta == 0.0} 分支在编译期即可消除，从而避免运行时判断开销。
+
+\begin{lstlisting}[language=Python, caption={smooth\_l1\_loss 前向 kernel（code/ops/smooth\_l1\_loss.py，节选）}, label={code:smooth}]
+@triton.jit
+def _smooth_l1_loss_kernel(inp, target, out, n_elements,
+                           beta: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    inp_val    = tl.load(inp    + offsets, mask=mask, other=0.0).to(tl.float32)
+    target_val = tl.load(target + offsets, mask=mask, other=0.0).to(tl.float32)
+    diff = tl.abs(inp_val - target_val)
+    if beta == 0.0:                 # 编译期特化分支
+        loss = diff
+    else:
+        loss = tl.where(diff < beta, 0.5 * diff * diff / beta, diff - 0.5 * beta)
+    tl.store(out + offsets, loss, mask=mask)
+\end{lstlisting}
+
+该算子还实现了 \texttt{partial\_sum} kernel 用于 \texttt{mean}/\texttt{sum} 归约模式下的分块累加，以及对应的反向 kernel。三者协同覆盖了 PyTorch \texttt{smooth\_l1\_loss} 的全部参数组合。FlagGems 已实现前向与反向，本案例工作集中在测试覆盖的增强。
+
+\subsection{池化算子：avg\_pool3d 与 max\_pool3d 的 Tile 并行}
+三维池化是中等算子中计算最密集的一类。\texttt{avg\_pool3d} 与 \texttt{max\_pool3d} 共享相同的 Tile 划分，但归约语义不同。平均池化执行加法归约后除以核体积或 \texttt{divisor\_override}，加法满足结合律，天然适合树形并行。最大池化执行比较归约，反向传播需要前向记录的 \texttt{argmax} 索引把梯度散射回唯一选中位置，因此必须同时维护最大值与最大值扁平索引两个累加器。\texttt{avg\_pool3d} 的归一化另有细节，当 \texttt{count\_include\_pad} 为真时除以核体积 $k_d k_h k_w$，为假时除以实际落在输入内的元素数，后者需额外的掩码计数。\texttt{divisor\_override} 允许用户传入自定义除数，常用于保证前向与反向的数值一致性。由于加法满足结合律，avg 池化的反向比 max 简单，梯度按均摊权重散射回核窗口内每个位置。以 \texttt{max\_pool3d} 为例，输入为 5D 张量 $(N, C, D, H, W)$，对每个输出位置 $(d_o, h_o, w_o)$，需在核窗口 $k_d \times k_h \times k_w$ 内取最大值。关键并行策略是输出中心型的二维 Tile，每个线程块负责输出张量 $H$-$W$ 平面上的一个 $\text{BLOCK\_H} \times \text{BLOCK\_W}$ 矩形块，深度维 $D$ 在 kernel 内部循环，见图~\ref{fig:pool-tile}。这种划分使一个 block 内的线程在 $H$、$W$ 方向连续读取输入，利于合并访问。\texttt{kernel\_d}、\texttt{kernel\_h}、\texttt{kernel\_w} 用 \texttt{tl.static\_range} 展开为编译期循环，便于指令调度。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[scale=0.82, every node/.style={font=\small}]
+% 输入 feature map
+\draw[fill=blue!8] (0,0) rectangle (4.2,3);
+\foreach \i in {0,1,2} \foreach \j in {0,1,2,3,4,5} \draw (\i*1.0+0.1,\j*0.5+0.1) rectangle +(\i*0+0.8,\j*0+0.3);
+\node[above] at (2.1,3) {输入 $(D{\times}H{\times}W)$};
+% 输出 tile
+\begin{scope}[xshift=6cm]
+\draw[fill=orange!12] (0,0) rectangle (4.2,3);
+\fill[orange!55!black, opacity=0.45] (1.1,0.6) rectangle (2.9,1.6);
+\draw[ultra thick, red!70!black] (1.1,0.6) rectangle (2.9,1.6);
+\node[red!70!black, font=\scriptsize] at (2.0,1.1) {BLOCK\_H$\times$BLOCK\_W};
+\node[above] at (2.1,3) {输出 $(D_o{\times}H_o{\times}W_o)$};
+\end{scope}
+% 箭头与标注
+\draw[->, thick, gray!70] (4.4,1.5) -- (5.8,1.5) node[midway, above, font=\scriptsize]{核窗口取 max};
+% 深度循环
+\node[font=\scriptsize, align=center] at (10.2,1.5) {深度维 $D$\\在 kernel 内\\用 static\_range 循环};
+\end{tikzpicture}
+\caption{max\_pool3d 的输出中心型 Tile 策略：每个 block 处理输出 $H$-$W$ 平面的一个矩形块}
+\label{fig:pool-tile}
+\end{figure}
+
+前向 kernel 的核心三重循环对核窗口内的输入取逐元素最大值，并用掩码处理边界与 padding（代码~\ref{code:pool-fwd}）。
+
+\begin{lstlisting}[language=Python, caption={max\_pool3d 前向 kernel 的核窗口归约（code/ops/max\_pool3d\_with\_indices.py，节选）}, label={code:pool-fwd}]
+for kd in tl.static_range(0, kernel_d):
+    d_in = d_out * stride_d - padding_d + kd * dilation_d
+    d_valid = (d_in >= 0) & (d_in < in_d)
+    for kh in tl.static_range(0, kernel_h):
+        for kw in tl.static_range(0, kernel_w):
+            h_in = h_out_offsets[:, None] * stride_h - padding_h + kh * dilation_h
+            w_in = w_out_offsets[None, :] * stride_w - padding_w + kw * dilation_w
+            in_mask = (d_valid & (h_in >= 0) & (h_in < in_h)
+                       & (w_in >= 0) & (w_in < in_w))
+            current_val = tl.load(input_base_ptr + input_offset,
+                                  mask=in_mask, other=min_val)
+            is_new_max = current_val > max_val_acc
+            max_val_acc = tl.where(is_new_max, current_val, max_val_acc)
+            max_idx_acc = tl.where(is_new_max & in_mask,
+                                   current_idx, max_idx_acc)
+\end{lstlisting}
+
+前向 kernel 的 host 端 wrapper 负责计算输出形状、分配输出与索引张量，并构建二维 grid，见代码~\ref{code:pool-wrap}。grid 第一维遍历所有 $(N, C)$ 通道批次，第二维把 $(D_o, H_o, W_o)$ 的输出空间展平为一个 program 实例索引，对应图~\ref{fig:pool-tile} 中每个 block 处理一个 $H$-$W$ 矩形块、$D$ 维在 kernel 内循环的设计。\texttt{ceil\_mode} 通过 \texttt{pool3d\_output\_size} 中的向上取整与 PyTorch 兼容性修正实现，是池化算子最易出错的边界之一。
+
+\begin{lstlisting}[language=Python, caption={max\_pool3d 前向的 host wrapper 与 grid 构建（code/ops/max\_pool3d\_with\_indices.py，节选）}, label={code:pool-wrap}]
+def max_pool3d_with_indices(input, kernel_size, stride=None,
+                            padding=0, dilation=1, ceil_mode=False):
+    input = input.contiguous()
+    kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw = _parse_pool3d_params(...)
+    in_n, in_c, in_d, in_h, in_w = input.shape
+    out_d = pool3d_output_size(in_d, kd, sd, pd, dd, ceil_mode)
+    out_h = pool3d_output_size(in_h, kh, sh, ph, dh, ceil_mode)
+    out_w = pool3d_output_size(in_w, kw, sw, pw, dw, ceil_mode)
+    output  = torch.empty((in_n, in_c, out_d, out_h, out_w), device=..., dtype=input.dtype)
+    indices = torch.empty((in_n, in_c, out_d, out_h, out_w), device=..., dtype=torch.int64)
+    # 二维 grid：(N*C,  out_d * num_h_blocks * num_w_blocks)
+    grid = lambda meta: (
+        in_n * in_c,
+        out_d * triton.cdiv(out_h, meta["BLOCK_H"]) * triton.cdiv(out_w, meta["BLOCK_W"]),
+    )
+    max_pool3d_forward_kernel[grid](input, output, indices,
+        input.stride(0), input.stride(1), input.stride(2), input.stride(3), input.stride(4),
+        in_c, in_d, in_h, in_w, out_d, out_h, out_w,
+        kd, kh, kw, sd, sh, sw, pd, ph, pw, dd, dh, dw)
+    return output, indices
+\end{lstlisting}
+
+\subsection{反向传播实现：upsample\_nearest2d 的 atomic\_add 散射}
+本案例为 \texttt{upsample\_nearest2d} 新增了反向传播实现。\texttt{upsample\_nearest2d} 的前向是最近邻放大，输出位置 $(o_h, o_w)$ 复制输入位置 $(\lfloor o_h / s_h \rfloor, \lfloor o_w / s_w \rfloor)$ 的值。反向传播需要把输出梯度 $\partial L / \partial O$ 散射回输入梯度 $\partial L / \partial I$，难点在多对一映射。多个输出位置可能对应同一输入位置，$s_h, s_w > 1$ 时为 $1{:}1$，$s_h, s_w < 1$ 时为多对一，因此必须用原子加 \texttt{tl.atomic\_add} 累加梯度，见图~\ref{fig:upsample-bwd}。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[scale=0.7, every node/.style={font=\small}]
+% 输出梯度 (大)
+\foreach \i in {0,1,2,3} \foreach \j in {0,1,2,3} {
+  \draw[fill=orange!15] (\i, \j) rectangle ++(1,1);
+}
+\node[above] at (2,4.3) {输出梯度 $\partial L/\partial O$ \scriptsize$(OH{\times}OW)$};
+% 输入梯度 (小)
+\begin{scope}[xshift=7cm, yshift=0.5cm]
+\foreach \i in {0,1} \foreach \j in {0,1} {
+  \draw[fill=blue!15] (\i, \j) rectangle ++(1,1);
+}
+\draw[ultra thick, red!70!black] (0,0) rectangle (2,2);
+\node[above] at (1,2.3) {输入梯度 $\partial L/\partial I$ \scriptsize$(IH{\times}IW)$};
+\end{scope}
+% 散射箭头
+\draw[->, red!70!black, thick] (0.5,3.5) to[bend left=15] (7.3,2.3);
+\draw[->, red!70!black, thick] (1.5,3.5) to[bend left=10] (7.7,2.3);
+\draw[->, red!70!black, thick] (0.5,2.5) to[bend left=20] (7.2,1.8);
+\node[font=\scriptsize, red!70!black] at (3.7,3.3) {\texttt{atomic\_add}};
+\node[font=\scriptsize, align=center] at (3.6,2.0) {多个输出位置\\散射到同一输入位置};
+\end{tikzpicture}
+\caption{upsample\_nearest2d 反向传播的散射示意：多对一映射需原子加累加}
+\label{fig:upsample-bwd}
+\end{figure}
+
+反向 kernel 的核心代码见代码~\ref{code:upsample-bwd}。实现有两个工程要点。梯度累加缓冲区 \texttt{grad\_input} 显式用 \texttt{float32} 初始化，避免半精度 fp16 与 bf16 在 \texttt{atomic\_add} 时的舍入误差累积。由于 \texttt{atomic\_add} 不支持 \texttt{@triton.autotune}，warmup 期间会被重复计入统计，反向 kernel 改用 \texttt{@triton.heuristics} 配固定 \texttt{BLOCK\_SIZE=1024} 调度。
+
+\begin{lstlisting}[language=Python, caption={upsample\_nearest2d 反向 kernel 的原子散射（code/ops/upsample\_nearest2d.py，节选）}, label={code:upsample-bwd}]
+@libentry()
+@triton.heuristics(runtime.get_heuristic_config("upsample_nearest2d"))
+@triton.jit
+def upsample_nearest2d_backward_kernel(grad_output_ptr, grad_input_ptr,
+        N, C, OH, OW, IH, IW, reciprocal_scale_h, reciprocal_scale_w,
+        BLOCK_SIZE: tl.constexpr, SAME_H: tl.constexpr, SAME_W: tl.constexpr,
+        USE_INT32_IDX: tl.constexpr):
+    # 计算输出 -> 输入的坐标映射
+    ow = idx % OW
+    oh = idx // OW % OH
+    ih = tl.minimum((oh * reciprocal_scale_h).to(tl.int32), IH - 1)
+    iw = tl.minimum((ow * reciprocal_scale_w).to(tl.int32), IW - 1)
+    grad_output_offset = (nc_iter * OH + oh) * OW + ow
+    grad_input_offset  = (nc_iter * IH + ih) * IW + iw
+    while nc_iter < NC:
+        grad_val = tl.load(grad_output_ptr + grad_output_offset,
+                           mask=valid_mask, other=0.0)
+        tl.atomic_add(grad_input_ptr + grad_input_offset, grad_val, mask=valid_mask)  # 原子累加
+        ...
+# 调用侧：float32 累加缓冲，避免半精度舍入
+grad_input = torch.zeros((N, C, IH, IW), device=grad_output.device, dtype=torch.float32)
+...
+return grad_input.to(grad_output.dtype)
+\end{lstlisting}
+
+该实现新增 108 项测试（前向 + 反向 + 非连续输入，3 种数据类型 $\times$ 多形状 $\times$ 多缩放因子）全部通过，是本案例最重要的新增功能之一。
+
+\subsection{反向传播的工程决策：conv\_transpose2d 的 aten fallback}
+\texttt{conv\_transpose2d} 转置卷积前向有四条不同的 kernel 路径，包括直接 tiled、$3\times3$ stride-2 特化、残差、通用路径。为每条前向路径手写对应反向 kernel 意味着维护 4 套反向逻辑，工程成本与出错风险都很高。本案例采取务实的工程决策，前向走优化的 Triton kernel，反向复用 PyTorch 原生 \texttt{aten::convolution\_backward}，见代码~\ref{code:conv-bwd}。
+
+\begin{lstlisting}[language=Python, caption={conv\_transpose2d 反向：委托 aten 实现（code/ops/conv\_transpose2d.py）}, label={code:conv-bwd}]
+def conv_transpose2d_backward(grad_output, input, weight, bias_sizes,
+        stride, padding, dilation, transposed, output_padding, groups, output_mask):
+    """前向走优化的 Triton kernel，反向正确性委托给 aten 实现。"""
+    return torch.ops.aten.convolution_backward(
+        grad_output, input, weight, bias_sizes, stride, padding,
+        dilation, transposed, output_padding, groups, output_mask)
+\end{lstlisting}
+
+这一决策的合理性在于，前向是推理路径上的性能热点，必须用 Triton 优化，反向主要服务训练，PyTorch 已有高度优化的 cuDNN 实现，复用既保证正确性又避免重复造轮子。这种择优融合的策略在开源算子库中常见且被接受，本案例在注册表中显式登记，使 \texttt{enable\_gems()} 后自动生效。
+
+\subsection{反向传播实现的工程要点}
+综合 \texttt{upsample\_nearest2d} 与 \texttt{conv\_transpose2d} 两个反向实现，可以提炼出何时手写 Triton 反向、何时复用 aten 的工程判据，见表~\ref{tab:bwd}。核心权衡维度有三个，前向 kernel 是否已存在多条特化路径，路径越多反向越复杂，反向是否是性能热点，推理为主则反向次要，以及手写正确性的风险，atomic 操作易引入数值误差。
+
+\begin{table}[!htbp]
+\centering\small
+\caption{反向传播两种实现策略的工程权衡}
+\label{tab:bwd}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\textwidth}{p{2.2cm}XX}
+\toprule
+维度 & 手写 Triton 反向 & 复用 aten 反向 \\
+\midrule
+典型场景 & upsample\_nearest2d、max\_pool3d & conv\_transpose2d \\
+前向路径数 & 单一 kernel & 多条特化路径（4 条） \\
+性能收益 & 高（消除 dispatch 开销） & 低（cuDNN 已优化） \\
+正确性风险 & 中（需处理 atomic/精度） & 低（委托成熟实现） \\
+维护成本 & 高（前反向成对维护） & 低（仅维护前向） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+实践中得到两条经验。反向 kernel 若涉及 \texttt{atomic\_add}，务必使用 \texttt{float32} 累加缓冲再转回目标精度，否则半精度的舍入会在多次累加下显著放大。反向 kernel 因含原子操作，不能用 \texttt{@triton.autotune}，warmup 期间原子操作的副作用会被重复计入基准，应改用 \texttt{@triton.heuristics} 配固定块大小，这是本案例踩过的实际坑点。
+
+\section{复杂场景算子开发}
+
+\subsection{线性代数：SVD 的 Jacobi 旋转并行化}
+奇异值分解 $A = U\Sigma V^\top$ 是数值线性代数的基石。GPU 上的 SVD 通常依赖专有的 cuSOLVER 分治算法，FlagGems 则采用纯 Triton 实现的 Jacobi 旋转方法，迭代地对对称化矩阵 $A^\top A$ 施加 Givens 旋转消去非对角元，直至收敛。核心是构造旋转角 $\theta$ 使目标非对角元置零。
+\[
+\tan(2\theta) = \frac{2 A_{pq}}{A_{pp} - A_{qq}}, \qquad A' = J(p,q,\theta)^\top A\, J(p,q,\theta),
+\]
+其中 $J(p,q,\theta)$ 是 Givens 旋转矩阵。完整流程见算法~\ref{algo:jacobi}，其中第 7 步的两次矩阵乘可并行化为块状运算，天然适合 Triton 的 Block 抽象。
+
+\begin{algorithm}[!htbp]
+\caption{对称特征值分解的循环 Jacobi 算法}
+\label{algo:jacobi}
+\begin{algorithmic}[1]
+\Require 对称矩阵 $A\in\mathbb{R}^{n\times n}$，容差 $\epsilon$
+\Ensure 特征值 $\Lambda$，特征向量矩阵 $V$
+\State $V \gets I_n$
+\While{$A$ 的非对角范数 $> \epsilon$}
+  \State 选取绝对值最大的非对角元 $A_{pq}$
+  \State $\theta \gets \tfrac{1}{2}\,\mathrm{atan2}\big(2 A_{pq},\; A_{pp}-A_{qq}\big)$
+  \State 构造 Givens 旋转 $J(p,q,\theta)$
+  \State $A \gets J^\top A\,J$ \Comment{同步消去 $A_{pq}$，更新行列}
+  \State $V \gets V\,J$ \Comment{累积特征向量}
+\EndWhile
+\State \Return $\mathrm{diag}(A),\ V$
+\end{algorithmic}
+\end{algorithm}
+
+Jacobi 方法的计算复杂度为 $O(n^3)$ 次旋转，cuSOLVER 的分治法更高效，这直接导致本案例观察到的一个算法层面的性能局限。对于 $n \geqslant 16$ 的方阵，Triton SVD 相对 cuSOLVER 的加速比为 $0.43\times$ 至 $0.77\times$。但对批处理与小秩场景，即一次分解大量小矩阵，由于避免了 cuSOLVER 的 host-device 同步开销，Triton 实现的加速比可达 $6\times$ 至 $223\times$。这一对比说明算法选择必须匹配使用场景，批处理小矩阵正是 SVD 在 LoRA、注意力头分析等 LLM 场景的典型用法。
+
+\subsection{序列损失：CTC Loss 的动态规划}
+联结主义时间分类 CTC 损失用于无对齐标签的序列学习，如语音识别与 OCR。其前向-后向算法基于动态规划。定义 $\alpha_t(s)$ 为前向概率，递推式为
+\[
+\alpha_t(s) = \big(\alpha_{t-1}(s) + \alpha_{t-1}(s-1) + \mathbb{1}_{\text{rep}}\,\alpha_{t-1}(s-2)\big)\cdot y_{t, \ell_s},
+\]
+其中 $\mathbb{1}_{\text{rep}}$ 在允许重复跳转时为 1。该递推构成图~\ref{fig:ctc} 所示的二维网格，横轴为时间步 $t$，纵轴为对齐路径上的标签状态 $s$，每个节点 $\alpha_t(s)$ 依赖其左侧最多三个前驱节点 $s$、$s-1$、$s-2$，形成时间维必须串行而标签维可以并行的依赖结构。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[scale=0.78, every node/.style={font=\small}]
+\foreach \t in {0,1,2,3,4,5,6} \draw[gray!30] (\t,0)--(\t,4.2);
+\foreach \s in {0,1,2,3,4} \draw[gray!30] (0,\s)--(6.2,\s);
+\foreach \t/\s in {0/0,1/0,1/1,2/1,2/2,3/2,3/3,4/3,4/4,5/4,6/4} {
+  \fill[blue!50] (\t,\s) circle (3pt);
+}
+\foreach \t/\s in {2/0,3/1,4/1,4/2,5/2,5/3,6/3} {
+  \fill[gray!40] (\t,\s) circle (2pt);
+}
+% 转移箭头
+\foreach \t/\s in {1/1,2/2,3/3,4/4} \draw[->, orange!80!black, thick] (\t-1,\s-1)--(\t,\s);
+\foreach \t/\s in {1/1,2/2,3/3,4/4} \draw[->, red!70!black] (\t-1,\s)--(\t,\s);
+\foreach \t/\s in {2/2,3/3,4/4} \draw[->, green!60!black] (\t-1,\s-2) to[bend left=25] (\t,\s);
+\node[below] at (3,-0.3) {时间步 $t$};
+\node[left, rotate=90] at (-0.4,2.1) {标签状态 $s$};
+\node[orange!80!black, font=\scriptsize] at (6.6,3.0) {$s{-}1$};
+\node[red!70!black, font=\scriptsize] at (6.6,2.3) {$s$};
+\node[green!60!black, font=\scriptsize] at (6.6,1.6) {$s{-}2$};
+\end{tikzpicture}
+\caption{CTC 前向-后向算法的动态规划网格：每个节点依赖最多三个前驱，时间维串行、标签维并行}
+\label{fig:ctc}
+\end{figure}
+
+训练时还需要后向概率 $\beta_t(s)$，它从 $t=T$ 反向递推，依赖关系与 $\alpha$ 对称。最终的 CTC 损失为 $L = -\ln \alpha_T(s_{\text{final}})$，对网络输出 logits 的梯度由前向、后向概率的乘积 $\alpha_t(s)\beta_t(s)$ 对数求导得到。一次完整的 CTC 训练步需要前向、后向两遍动态规划，再合并求梯度，这是其计算密集与实现复杂的根源。
+
+CTC 的实现还需处理若干工程细节。输入序列长度通过 \texttt{input\_lengths} 变长，标签长度通过 \texttt{target\_lengths} 独立指定，kernel 必须按 batch 内每个样本的实际长度截断递推，而非使用统一的 $T$。空白标签 blank 的位置与重复标签的合并跳转由 $\mathbb{1}_{\text{rep}}$ 控制。数值稳定性依赖 log-sum-exp 技巧，把递推中的概率加法转化为对数域的最大值与修正项之和，避免长序列下浮点下溢。
+
+FlagGems 的 Triton 实现把时间维 $T$ 的递推串行展开（存在数据依赖），把 batch 与标签维度并行化，从而在 GPU 上高效完成动态规划。本案例验证了 \texttt{input\_lengths} 与 \texttt{target\_lengths} 变长参数的处理，82 项测试全部通过。
+
+\subsection{空间插值：grid\_sample 的双线性与最近邻}
+\texttt{grid\_sample} 根据采样网格 \texttt{grid} 对输入做可微插值，广泛用于空间变换网络与可微数据增强。它需支持 3 种 \texttt{padding\_mode} 即 zeros、border、reflection，与 2 种 \texttt{mode} 即 bilinear、nearest 的笛卡尔组合，反向传播需把梯度按插值权重散射回输入坐标。当采样坐标落在输入边界之外时，三种填充模式分别采取不同处理，见表~\ref{tab:pad}，在 kernel 中统一用 \texttt{tl.where} 与 clamp 运算实现，避免分支发散。双线性插值的权重为
+\[
+I(x,y) = \sum_{i,j \in \{0,1\}} w_{ij}\, I(\lfloor x\rfloor+i,\, \lfloor y\rfloor+j),\quad w_{ij}=|\lfloor x\rfloor+i-x|\cdot|\lfloor y\rfloor+j-y|.
+\]
+如图~\ref{fig:grid} 所示，采样坐标 $(x,y)$ 落在 4 个整数格点之间，每个邻居按其与采样点的距离贡献权重，反向传播时梯度按相同权重散射回这 4 个输入位置。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[scale=0.85, every node/.style={font=\small}]
+\foreach \i in {0,1,2,3} \foreach \j in {0,1,2,3} \draw[fill=blue!6] (\i,\j) rectangle ++(1,1);
+% 4 邻居
+\fill[gray!50] (1,1) circle (3pt) node[below left, font=\tiny] {$I_{00}$};
+\fill[gray!50] (2,1) circle (3pt) node[below right, font=\tiny] {$I_{10}$};
+\fill[gray!50] (1,2) circle (3pt) node[above left, font=\tiny] {$I_{01}$};
+\fill[gray!50] (2,2) circle (3pt) node[above right, font=\tiny] {$I_{11}$};
+\draw[gray!50] (1,1) rectangle (2,2);
+% 采样点
+\fill[red!70!black] (1.55,1.62) circle (3.5pt) node[above right, red!70!black] {$(x,y)$};
+\draw[dashed, red!70!black] (1.55,1)--(1.55,2);
+\draw[dashed, red!70!black] (1,1.62)--(2,1.62);
+\node[font=\tiny] at (1.275,0.6) {$\lfloor x \rfloor$};
+\node[font=\tiny] at (1.775,0.6) {$\lfloor x \rfloor{+}1$};
+\node[font=\scriptsize, red!70!black] at (3.3,1.62) {$w \propto$ 距离};
+\end{tikzpicture}
+\caption{grid\_sample 的双线性插值：采样点由周围 4 个整数格点按距离加权，反向梯度按同权重散射}
+\label{fig:grid}
+\end{figure}
+
+本案例验证了全部模式组合，106 项测试通过，14 项因极端大形状（$1024\times1024$）触发显存上限而跳过。三种填充模式对越界采样坐标的处理见表~\ref{tab:pad}。
+
+\begin{table}[!htbp]
+\centering\small
+\caption{grid\_sample 的三种 padding\_mode 对越界坐标的处理}
+\label{tab:pad}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+模式 & 越界坐标 $(x,y)$ 的处理 \\
+\midrule
+zeros & 直接返回 0（不访问输入） \\
+border & clamp 到 $[0, W{-}1]\times[0, H{-}1]$ 取边界像素 \\
+reflection & 以边界为轴镜像反射回有效区间 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{前沿融合算子：chunk\_gated\_delta\_rule}
+\texttt{chunk\_gated\_delta\_rule} 是线性注意力与门控 DeltaNet 的核心融合算子，源自 Flash Linear Attention（FLA）研究项目。给定查询 $q$、键 $k$、值 $v$、门控 $g$ 与衰减 $\beta$，其递推关系为
+\[
+S_t = (S_{t-1} + \beta_t (v_t - S_{t-1} k_t) k_t^\top)\, g_t, \qquad o_t = S_t q_t,
+\]
+其中 $S_t$ 为隐状态矩阵。朴素实现的瓶颈在于每一步都要读写中间矩阵 $S_t$，访存开销巨大。分块 chunk 融合把时间轴分成若干块，块内用矩阵乘法并行计算，块间递推隐状态，从而把 $O(T)$ 次标量更新转化为 $O(T/B)$ 次块状矩阵运算，大幅提升计算密度，见图~\ref{fig:chunk}。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[scale=0.82, every node/.style={font=\small}]
+% 时间轴
+\draw[->, thick] (0,0)--(8.5,0) node[right] {时间 $t$};
+\foreach \x in {0,2,4,6,8} \draw (\x,-0.1)--(\x,0.1);
+% 三个块
+\fill[blue!18] (0,0.3) rectangle (2,1.6);
+\fill[blue!18] (2,0.3) rectangle (4,1.6);
+\fill[blue!18] (4,0.3) rectangle (6,1.6);
+\fill[blue!18] (6,0.3) rectangle (8,1.6);
+\node at (1,0.95) {块 1};
+\node at (3,0.95) {块 2};
+\node at (5,0.95) {块 3};
+\node at (7,0.95) {块 4};
+\node[font=\scriptsize, blue!60!black] at (1,2.0) {块内矩阵乘（并行）};
+% 块间递推
+\draw[->, red!70!black, thick] (2,1.3) .. controls (2.3,2.5) and (3.7,2.5) .. (4,1.3);
+\draw[->, red!70!black, thick] (4,1.3) .. controls (4.3,2.5) and (5.7,2.5) .. (6,1.3);
+\node[font=\scriptsize, red!70!black] at (5,2.8) {块间递推隐状态 $S$（串行）};
+\end{tikzpicture}
+\caption{chunk\_gated\_delta\_rule 的分块融合：块内并行矩阵乘提升计算密度，块间串行递推隐状态}
+\label{fig:chunk}
+\end{figure}
+
+理解该算子的价值需要联系注意力机制的发展脉络。标准的 softmax 注意力计算 $O = \mathrm{softmax}(QK^\top)V$，复杂度随序列长度 $T$ 呈 $O(T^2)$ 增长，在长上下文场景下成为显存与算力的双重瓶颈。线性注意力通过核技巧把 $\mathrm{softmax}$ 替换为可分离的核函数 $\phi$，将递推改写为 $S_t = S_{t-1} + \phi(k_t)\phi(v_t)^\top$、$o_t = S_t \phi(q_t)$，复杂度降为 $O(T)$。门控 DeltaNet 即 gated delta rule 在此基础上引入遗忘门 $g_t$ 与增量更新 $\beta_t$，使隐状态具备更强的遗忘与更新能力。然而其朴素实现的 $O(T)$ 次标量递推访存开销巨大，分块融合如 \texttt{chunk\_gated\_delta\_rule} 正是为此设计，它使线性注意力真正能在长序列上发挥理论优势。
+
+本案例的关键贡献是把这个算子注册到 \texttt{\_FULL\_CONFIG}。它此前虽已实现但未注册，\texttt{enable\_gems()} 无法拦截。注册后该算子取得 $2.2\times$ 至 $15.3\times$ 的显著加速，是 20 个算子中加速比最高的之一。实现中还包含一个 L2 归一化的辅助 kernel，用单次 \texttt{tl.reduce} 计算 $1/\sqrt{\sum x^2}$ 完成行归一化。33 项功能测试全部通过。
+
+\section{性能优化与结果分析}
+
+\subsection{全量回归测试结果}
+20 个算子的功能正确性通过分阶段的全量回归测试验证，最终基线为 2871 项通过、0 项失败、134 项跳过，见表~\ref{tab:regress}。跳过项均由 GPU 共享环境下的极端大形状显存上限触发，如 \texttt{grid\_sample} $1024\times1024$ 与 \texttt{scatter\_reduce} 的部分参数组合，非算子实现缺陷。
+
+\begin{table}[!htbp]
+\centering\small
+\caption{20 个算子的全量回归测试结果}
+\label{tab:regress}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{lcccc}
+\toprule
+阶段 & 通过 & 失败 & 跳过 & 耗时 \\
+\midrule
+第一阶段（简单 8 算子） & 969 & 0 & 0 & 68.79\,s \\
+第二阶段（中等 8 算子） & 1634 & 0 & 120 & 169.83\,s \\
+第三阶段（困难 4 算子） & 268 & 0 & 14 & 50.74\,s \\
+\textbf{合计（20 算子）} & \textbf{2871} & \textbf{0} & \textbf{134} & \textbf{289.36\,s} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.85\textwidth, height=5.5cm,
+  ybar stacked, bar width=28pt,
+  enlarge x limits=0.25,
+  ylabel={测试用例数}, ylabel style={font=\small},
+  symbolic x coords={第一阶段,第二阶段,第三阶段},
+  xtick=data, x tick label style={font=\small},
+  ymin=0, ymax=2050,
+  legend style={at={(0.5,1.02)}, anchor=south, legend columns=3, font=\small, draw=none},
+  nodes near coords style={font=\tiny, text=black},
+  ]
+\addplot[fill=blue!45, draw=blue!60!black] coordinates {(第一阶段,969) (第二阶段,1634) (第三阶段,268)};
+\addplot[fill=gray!50, draw=gray!70!black] coordinates {(第一阶段,0) (第二阶段,120) (第三阶段,14)};
+\legend{通过, 跳过(显存)}
+\end{axis}
+\end{tikzpicture}
+\caption{三阶段测试用例规模分布（合计 2871 通过 / 134 跳过）}
+\label{fig:stacked}
+\end{figure}
+
+\subsection{自动调优案例：max\_pool3d 反向 kernel 的优化}
+剖析具体优化前，先理解 \texttt{@triton.autotune} 的工作机制，见图~\ref{fig:autotune}。对一个被 \texttt{autotune} 装饰的 kernel，Triton 在首次遇到一组新的 \texttt{key} 如形状、核大小时，会把所有候选配置即块大小、\texttt{num\_warps}、\texttt{num\_stages} 逐一实例化、warmup、实测耗时，再选择中位数最短的配置缓存下来，后续相同 \texttt{key} 的调用直接命中缓存。因此扩展候选配置的搜索空间，并为访存密集型 kernel 标注 \texttt{num\_stages}，是两条最直接的优化手段。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.35cm,
+  cfg/.style={draw, rounded corners=2pt, minimum height=0.6cm, minimum width=2.6cm, align=center, font=\scriptsize, fill=blue!8},
+  op/.style={draw, rounded corners=2pt, minimum height=0.7cm, minimum width=1.8cm, align=center, font=\scriptsize, fill=orange!12},
+  arr/.style={-{Stealth[length=1.8mm]}, thick, draw=gray!70}]
+\node[cfg] (c1) {配置1 \scriptsize BLOCK=16, stages=4};
+\node[cfg, below=of c1] (c2) {配置2 \scriptsize BLOCK=8, stages=5};
+\node[cfg, below=of c2] (c3) {\dots};
+\node[cfg, below=of c3] (c12) {配置12 \scriptsize BLOCK=64, stages=2};
+\node[op, right=1.6cm of c2] (bench) {逐一 warmup\\+ benchmark};
+\node[op, right=1.4cm of bench] (best) {选 argmin\\(中位数最短)};
+\node[op, below=0.3cm of best] (cache) {缓存\\(shape $\to$ 配置)};
+\draw[arr] (c1.east) -- (bench.west); \draw[arr] (c2.east) -- (bench.west);
+\draw[arr] (c12.east) -- (bench.west);
+\draw[arr] (bench)--(best); \draw[arr] (best)--(cache);
+\node[font=\scriptsize, above=0.05cm of c1] {候选配置集};
+\end{tikzpicture}
+\caption{@triton.autotune 的工作机制：对新形状逐一实测所有候选配置并缓存最优}
+\label{fig:autotune}
+\end{figure}
+
+\texttt{max\_pool3d} 反向是本案例性能优化的重点。反向 kernel 采用输入中心型策略，对每个输入位置 $(d, h, w)$，遍历所有可能选中它的输出窗口，累加匹配位置的梯度，见图~\ref{fig:pool-bwd}。这一策略在步长小于核即 $s < k$ 时计算量增大，是性能瓶颈所在。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[scale=0.78, every node/.style={font=\small}]
+\draw[fill=blue!10] (0,0) rectangle (3.6,3);
+\fill[red!50, opacity=0.4] (1.0,1.0) rectangle (1.8,1.8);
+\draw[thick, red!70!black] (1.0,1.0) rectangle (1.8,1.8);
+\node[red!70!black, font=\tiny] at (1.4,1.4) {输入点};
+\node[above] at (1.8,3) {输入梯度 $(D{\times}H{\times}W)$};
+\begin{scope}[xshift=5.5cm]
+\draw[fill=orange!12] (0,0) rectangle (3.6,3);
+\foreach \i/\j in {0.2/0.2, 1.0/0.2, 0.2/1.0, 1.0/1.0} {
+  \draw[gray!60] (\i,\j) rectangle ++(1.4,1.4);
+}
+\fill[orange!60, opacity=0.5] (1.0,1.0) rectangle (2.4,2.4);
+\node[above] at (1.8,3) {输出梯度 $(D_o{\times}H_o{\times}W_o)$};
+\node[font=\scriptsize, align=center] at (1.7,1.7) {可能的\\选中窗口};
+\end{scope}
+\draw[->, thick, gray!70] (3.8,1.5) -- (5.3,1.5) node[midway, above, font=\scriptsize]{反向遍历};
+\end{tikzpicture}
+\caption{max\_pool3d 反向的输入中心型策略：每个输入点查找所有可能选中它的输出窗口}
+\label{fig:pool-bwd}
+\end{figure}
+
+原始实现仅配置 6 组 autotune 参数，且缺少 \texttt{num\_stages} 软流水级数，导致大 batch、小空间维度的配置加速比低至 $0.35\times$。本案例把搜索空间扩展到 12 组配置，并为每组显式标注 \texttt{num\_stages} 与 \texttt{num\_warps}，见代码~\ref{code:autotune}。\texttt{num\_stages} 控制 Triton 编译器的软件流水线深度，它使下一次迭代的访存与当前迭代的计算重叠，对访存密集的反向 kernel 收益显著。
+
+\begin{lstlisting}[language=Python, caption={max\_pool3d 反向 kernel 的 autotune 配置（节选，含 num\_stages）}, label={code:autotune}]
+@libentry()
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_IN_H": 16, "BLOCK_IN_W": 16}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_IN_H":  8, "BLOCK_IN_W":  8}, num_stages=5, num_warps=2),
+        triton.Config({"BLOCK_IN_H": 16, "BLOCK_IN_W":  8}, num_stages=5, num_warps=2),
+        triton.Config({"BLOCK_IN_H": 64, "BLOCK_IN_W": 64}, num_stages=2, num_warps=8),
+        triton.Config({"BLOCK_IN_H": 32, "BLOCK_IN_W": 64}, num_stages=2, num_warps=8),
+        # ... 共 12 组配置，覆盖小空间(高 num_stages)到大空间(大 block)全谱
+    ],
+    key=["in_d", "in_h", "in_w", "kernel_d", "kernel_h", "kernel_w",
+         "stride_d", "stride_h", "stride_w"])
+@triton.jit
+def max_pool3d_backward_kernel(grad_output_ptr, indices_ptr, grad_input_ptr, ...):
+    ...
+\end{lstlisting}
+
+优化效果见图~\ref{fig:pool-opt} 与表~\ref{tab:pool-opt}。大 batch 小空间维度的关键配置 $32\times256\times1\times4\times4$ 与 $32\times256\times2\times4\times4$ ceil 模式，加速比从 $0.35\times$ 至 $0.58\times$ 跃升至 $1.05\times$ 至 $1.74\times$，提升幅度达 $+183\%$ 至 $+198\%$，跨过了竞赛 $0.9\times$ 的达标线。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.92\textwidth, height=6cm,
+  ybar, bar width=7pt,
+  enlarge x limits=0.14,
+  ylabel={相对 PyTorch 加速比}, ylabel style={font=\small},
+  symbolic x coords={S1,S2,S3,S4,S5},
+  xtick=data,
+  x tick label style={font=\small},
+  ymin=0, ymax=2.0,
+  legend style={at={(0.5,1.02)}, anchor=south, legend columns=2, font=\small, draw=none},
+  ]
+\addplot[fill=gray!45, draw=gray!60!black] coordinates {(S1,0.360) (S2,0.577) (S3,0.971) (S4,0.882) (S5,1.325)};
+\addplot[fill=blue!45, draw=blue!60!black] coordinates {(S1,1.051) (S2,1.717) (S3,1.043) (S4,0.905) (S5,1.543)};
+\draw[dashed, red!70!black, thick] (axis cs:S1,0.9) -- (axis cs:S5,0.9);
+\node[font=\tiny, red!70!black] at (axis cs:S5,1.0) {$0.9\times$};
+\legend{优化前(无 num\_stages), 优化后(12 组配置)}
+\end{axis}
+\end{tikzpicture}
+\caption{max\_pool3d 反向 kernel 优化前后加速比对比（fp32，S1--S5 为 5 组代表性形状）}
+\label{fig:pool-opt}
+\end{figure}
+
+\begin{table}[!htbp]
+\centering\small
+\caption{max\_pool3d 反向 kernel 关键配置的优化效果（形状记号见图~\ref{fig:pool-opt}）}
+\label{tab:pool-opt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{llcccc}
+\toprule
+形状记号 & 配置 & 优化前 & 优化后 & 提升 \\
+\midrule
+S1: $32\times256\times1\times4\times4$ & $k{=}3,s{=}2$ & 0.360$\times$ & 1.051$\times$ & $+192\%$ \\
+S2: $32\times256\times2\times4\times4$ & $k{=}3,s{=}2$,ceil & 0.577$\times$ & 1.717$\times$ & $+198\%$ \\
+S3: $16\times128\times2\times12\times12$ & $k{=}3,s{=}1,d{=}2$ & 0.971$\times$ & 1.043$\times$ & $+7.4\%$ \\
+S4: $8\times64\times6\times26\times26$ & $k{=}3,s{=}1,d{=}2$ & 0.882$\times$ & 0.905$\times$ & $+2.6\%$ \\
+S5: $4\times3\times14\times54\times54$ & $k{=}3,s{=}1,d{=}2$ & 1.325$\times$ & 1.543$\times$ & $+16.5\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{性能基准综合分析}
+综合 20 个算子的基准结果，可归纳出三条性能规律。逐点算子如 log10、cosh 因访存受限，加速比稳定在 $0.8\times$ 至 $1.5\times$ 区间，性能差异主要源于 Triton 与 PyTorch 在边界处理与广播上的等价但不同实现。布局与索引算子如 tril、roll 计算极简、纯访存，Triton 的合并访存优化反而超越 PyTorch 原生，tril 达 $2.78\times$。融合算子 \texttt{chunk\_gated\_delta\_rule} 因消除多个中间张量的显存落盘，加速比最高达 $15.3\times$，印证算子融合是突破内存墙的最有效手段。图~\ref{fig:allbench} 在对数坐标下汇总代表性算子的峰值加速比，呈现从访存受限的逐点算子到计算密集的融合算子之间超过两个数量级的性能跨度。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.88\textwidth, height=5.8cm,
+  ybar, bar width=12pt,
+  ymode=log,
+  enlarge x limits=0.10,
+  ylabel={峰值加速比（对数轴）}, ylabel style={font=\small},
+  symbolic x coords={log10,gcd,tril,max\_pool3d,chunk\_gdr,svd(批)},
+  xtick=data, x tick label style={font=\small, rotate=15, anchor=east},
+  ymin=1, ymax=300,
+  nodes near coords, nodes near coords style={font=\tiny},
+  ]
+\addplot[fill=blue!45, draw=blue!60!black] coordinates {
+  (log10,1.25) (gcd,1.77) (tril,2.78) (max\_pool3d,3.33) (chunk\_gdr,15.3) (svd(批),223)};
+\end{axis}
+\end{tikzpicture}
+\caption{代表性算子的峰值加速比（对数轴）：逐点 $\approx 1\times$，融合/批处理可达数十至数百倍}
+\label{fig:allbench}
+\end{figure}
+
+上述性能规律的背后是一套系统性的瓶颈定位方法。实践中先用 Roofline 模型判断算子属于计算受限还是访存受限。把算子的计算密度 FLOPs/Byte 绘制在硬件 Roofline 上，落在带宽斜坡段即为访存受限，落在峰值平台段即为计算受限。前者的优化重点是合并访存与数据复用，后者的重点是分块与张量核心利用率。进一步可用 NVIDIA Nsight Compute 对单个 kernel 做细粒度剖析，关注内存吞吐占峰值比例、指令发射效率、长时延指令占比等指标。
+
+本案例中 \texttt{max\_pool3d} 反向的 \texttt{num\_stages} 调优，正是依据内存等待占比偏高这一信号做出的。它说明访存未与计算重叠，引入软件流水线即 \texttt{num\_stages > 1} 可让下一次迭代的载入与当前迭代的比较重叠执行，从而隐藏访存延迟。当一个访存密集型 kernel 的加速比不理想，且剖析显示内存带宽未打满时，优先扩展 autotune 搜索空间并显式标注 \texttt{num\_stages}，往往是最具性价比的优化手段。
+
+综合本案例的全部优化实践，可以提炼出一棵算子性能优化决策树，见图~\ref{fig:tree}。遇到不达标的算子时，先用 Roofline 判断瓶颈类型，再沿对应分支选择手段。决策树把凭直觉调优转化为按证据决策，避免在不该用力处浪费时间，例如对一个已经打满带宽的逐点算子继续调 \texttt{num\_stages} 收益甚微。
+
+\begin{figure}[!htbp]
+\centering
+\begin{tikzpicture}[
+  every node/.style={font=\scriptsize, align=center},
+  dec/.style={draw, diamond, aspect=2, fill=blue!10, inner sep=1pt, minimum width=2.4cm},
+  act/.style={draw, rounded corners=2pt, fill=green!10, minimum width=2.2cm, minimum height=0.5cm},
+  arr/.style={-{Stealth[length=1.5mm]}, thick, draw=gray!70}]
+\node[dec] (r) {算子加速比\\不达标？};
+\node[dec, below left=0.7cm and 0.2cm of r] (m) {访存受限？\\(带宽未打满)};
+\node[dec, below right=0.7cm and 0.2cm of r] (c) {计算受限？\\(带宽已打满)};
+\node[act, below=0.6cm of m, xshift=-1.6cm] (a1) {合并访存/\\数据复用};
+\node[act, below=0.6cm of m, xshift=0.2cm] (a2) {num\_stages\\软流水};
+\node[act, below=0.6cm of c, xshift=-0.2cm] (a3) {Tile 调整/\\张量核心};
+\node[act, below=0.6cm of c, xshift=1.6cm] (a4) {算法替换\\(如 SVD)};
+\draw[arr] (r) -- (m) node[midway, above, font=\tiny]{是};
+\draw[arr] (r) -- (c);
+\draw[arr] (m) -- (a1); \draw[arr] (m) -- (a2);
+\draw[arr] (c) -- (a3); \draw[arr] (c) -- (a4);
+\node[font=\tiny, right=0.1cm of r] {否则：已达带宽峰值，验收};
+\end{tikzpicture}
+\caption{算子性能优化的决策树：先判瓶颈类型，再沿分支选择手段}
+\label{fig:tree}
+\end{figure}
+
+\subsection{算法局限性与工程权衡}
+并非所有算子都能全面超越基线，对低于阈值的情况必须做出透明的工程权衡。\texttt{svd} 方阵 $n\geqslant16$ 的 $0.43\times$ 至 $0.77\times$ 源于 Jacobi 旋转算法本身的 $O(n^3)$ 复杂度，要改善需整体改用分治算法，超出本案例范围，故作为已知算法局限如实记录。\texttt{asinh} 在极小形状下的 $0.66\times$ 属逐点算子的固有开销，典型形状下性能可接受。\texttt{grid\_sample} nearest 模式的 $0.94\times$ 处于测量噪声范围内。这些边界情形的处理方式，明确标注、记录原因而非掩盖，本身就是开源工程实践的重要组成。
+
+\subsection{交付物：13 个文件与提交}
+本案例的最终交付是对 FlagGems 仓库的 13 个文件改动，见表~\ref{tab:files}，以 PR \#3460 形式提交，标题含竞赛要求的前缀 \texttt{[FlagGems Operator Development Competition]}，并通过 CLA 贡献者许可协议签署。完整配套代码随本报告提供，见 \texttt{code/} 目录。
+
+\begin{table}[!htbp]
+\centering\small
+\caption{交付的 13 个文件改动分类}
+\label{tab:files}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+类别 & 文件 & 改动性质 \\
+\midrule
+新增 backward & upsample\_nearest2d.py, conv\_transpose2d.py & 新反向实现 \\
+Bug 修复 & max\_pool3d\_with\_indices.py, test\_max\_pool3d.py & 移除错误 skip、精度容差修正 \\
+性能优化 & max\_pool3d\_with\_indices.py & autotune 扩展 + num\_stages \\
+注册 & \_\_init\_\_.py, ops/\_\_init\_\_.py & chunk\_gated\_delta\_rule 等注册 \\
+测试增强 & test\_\{logaddexp,asinh,leaky\_relu, & 非连续/特殊值/ \\
+ & avg\_pool3d,conv\_transpose2d,pixel\_shuffle, & 空张量/广播/ \\
+ & upsample\_nearest2d\}.py & 参数边界覆盖 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+为便于整体查阅，表~\ref{tab:ops20} 汇总全部 20 个算子的难度、计算类别、测试规模与代表加速比。简单算子的测试数与加速比区间来自第一阶段精确统计，困难算子标注已知的性能特征，中等算子统一标注达标状态。
+
+\begin{small}
+\begin{longtable}{lllcl}
+\caption{20 个算子的交付规格一览}\label{tab:ops20}\\
+\toprule
+算子 & 类别 & 难度 & 测试数 & 代表加速比 \\
+\midrule
+\endfirsthead
+\multicolumn{5}{l}{\small（续表~\ref{tab:ops20}）}\\ \toprule
+算子 & 类别 & 难度 & 测试数 & 代表加速比 \\ \midrule
+\endhead
+\midrule \multicolumn{5}{r}{\small 下页续}\\
+\endfoot
+\bottomrule
+\endlastfoot
+log10 & 逐点 & 简单 & 65 & $0.80\text{--}1.25\times$ \\
+logaddexp & 逐点 & 简单 & 48 & $0.86\text{--}1.50\times$ \\
+cosh & 逐点 & 简单 & 90 & $0.83\text{--}1.25\times$ \\
+asinh & 逐点 & 简单 & 88 & $0.66\text{--}1.21\times$ \\
+gcd & 整数逐点 & 简单 & 114 & $1.19\text{--}1.77\times$ \\
+tril & 布局索引 & 简单 & 276 & $1.01\text{--}2.78\times$ \\
+roll & 布局索引 & 简单 & 171 & — \\
+leaky\_relu & 逐点(分段) & 简单 & 117 & $0.89\text{--}1.21\times$ \\
+\midrule
+upsample\_nearest2d & 上采样 & 中等 & — & $\geqslant 0.9\times$（含新 backward）\\
+scatter\_reduce & 散射归约 & 中等 & — & $\geqslant 0.9\times$ \\
+median & 归约 & 中等 & — & $\geqslant 0.9\times$ \\
+smooth\_l1\_loss & 损失 & 中等 & — & $\geqslant 0.9\times$ \\
+pixel\_shuffle & 布局重排 & 中等 & — & $\geqslant 0.9\times$ \\
+conv\_transpose2d & 卷积 & 中等 & — & $\geqslant 0.9\times$（aten backward）\\
+avg\_pool3d & 池化 & 中等 & — & $\geqslant 0.9\times$ \\
+max\_pool3d & 池化 & 中等 & — & $1.0\text{--}3.3\times$（fwd）\\
+\midrule
+svd & 线性代数 & 困难 & 47 & 批处理 $6\text{--}223\times$，方阵 $0.43\text{--}0.77\times$ \\
+ctc\_loss & 损失(DP) & 困难 & 82 & — \\
+grid\_sample & 插值 & 困难 & 106 & nearest $0.94\times$ \\
+chunk\_gated\_delta\_rule & 融合 & 困难 & 33 & $2.2\text{--}15.3\times$ \\
+\end{longtable}
+\end{small}
+
+\clearpage  % 案例部分的浮动体在进入总结前全部排出，保证案例边界完整
+\reportpart{总结与展望}
+
+\section{总结与展望}
+
+\subsection{关键学习要点回顾}
+本案例通过 20 个算子的完整开发周期，系统掌握了 GPU 算子开发的核心方法论。在编程抽象层面，Triton 的 Block 级 SPMD 模型在保留接近手写 CUDA 性能的同时，把开发效率提升一个数量级，\texttt{pointwise\_dynamic} 的代码生成与 \texttt{libentry} 的注册封装则显示基础设施复用对开源库可维护性的决定性作用。在性能优化层面，\texttt{max\_pool3d} 反向的调优案例表明，\texttt{num\_stages} 软流水与 autotune 搜索空间扩展常能带来数倍提升，加速比的差异，逐点约 $1\times$ 与融合 $15\times$，进一步说明算子融合是突破内存墙的根本手段。在工程方法层面，以 \texttt{gems\_assert\_close} 的按类型容差体系保证精度，以 aten fallback 的择优融合平衡正确性与性能，对算法局限如 SVD 方阵如实记录而非掩盖。
+
+本案例也是一次完整的测试驱动与开源协作实践。每个算子先写覆盖特殊值、空张量、非连续内存的测试，再迭代实现直至全部通过，这种测试先于实现的节奏能有效锁定行为契约。13 个文件的改动以原子提交组织，配以符合社区规范的 PR 标题与 CLA 签署，是将个人工程成果转化为公共开源资产的标准流程。2871 项测试零失败的基线，正是这套流程的直接产物。
+
+\subsection{在 LLM 推理加速中的应用}
+本案例的算子直接服务于 LLM 推理与训练的高频路径。\texttt{logaddexp} 与 \texttt{log\_softmax} 同源，支撑注意力权重的对数域计算。\texttt{smooth\_l1\_loss} 与 \texttt{ctc\_loss} 是训练损失的核心。\texttt{chunk\_gated\_delta\_rule} 作为线性注意力的融合算子，其 $15\times$ 加速可直接转化为这类高效注意力变体如 DeltaNet、GLA 的推理吞吐提升。\texttt{svd} 服务于 LoRA 等低秩适配场景的批处理分解。将这些算子沉淀为 FlagGems 的 Triton 实现，意味着在 NVIDIA 与国产 GPU 上都能获得等价的性能，对软硬协同的自主生态有实际价值。
+
+算子融合对端到端延迟有非线性贡献。以线性注意力为例，朴素实现中 \texttt{chunk\_gated\_delta\_rule} 涉及的矩阵乘、门控、归一化若分别启动 kernel，仅算子启动开销与中间张量的 HBM 往返就会占据大部分时间。融合后单次 $15.3\times$ 的 kernel 加速，在序列长度增长时会进一步放大为整模型吞吐的成倍提升。FlagGems 这类纯 Triton 算子库相对调用 cuDNN 与 cuBLAS 的根本优势在于，只有源码可读、可改、可融合的算子，才能在新型模型结构上持续产生性能红利。
+
+\subsection{进一步探索方向}
+本案例也显示若干值得深入的方向。第一是 SVD 的算法升级，将 Jacobi 旋转替换为分治或随机化方法，有望改善方阵性能，同时保留 Triton 的可移植性。第二是自动融合的边界，\texttt{conv\_transpose2d} 反向目前依赖 aten fallback，未来可探索基于 \texttt{torch.compile} 的自动微分生成对应 Triton 反向 kernel。第三是多硬件适配，FlagGems 的 \texttt{runtime} 机制已支持昇腾、海光等后端，本案例在 NVIDIA 上调优的 autotune 配置如何迁移到这些架构、是否需要重新搜索，是国产 GPU 落地的关键问题。第四是长上下文算子，随着上下文长度从 $32$K 扩展至百万级 token，线性注意力的分块融合即 FLA 系列算子将成为新的性能热点，本案例对 \texttt{chunk\_gated\_delta\_rule} 的实践是这一方向的起点。
+
+从能力培养的角度看，Triton 算子开发是一条连接深度学习算法与底层系统的有效路径。它要求开发者同时理解算子的数学语义，如 SVD 的 Jacobi 迭代与 CTC 的动态规划，GPU 的硬件特征，如内存层次与 SIMT 执行，以及工程方法，如测试驱动、自动调优、开源协作。本案例的 20 个算子恰好覆盖这条路径上从最简单到最复杂的各类典型场景，可作为系统训练算法、硬件、工程三位一体能力的实践教材。掌握这套方法论后，面对未来可能出现的新型算子，如扩散模型的去噪步与混合专家的 router，读者将具备独立分析瓶颈、选择策略并交付高质量实现的能力。
+
+\section*{附录\quad Triton 常用编程接口速查}
+\addcontentsline{toc}{section}{附录：Triton 编程接口速查}
+本案例反复使用的 Triton 核心接口汇总于表~\ref{tab:api}，供读者开发新算子时参考。
+
+\begin{table}[!htbp]
+\centering\small
+\caption{Triton / FlagGems 常用编程接口}
+\label{tab:api}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+接口 & 作用 \\
+\midrule
+\texttt{tl.program\_id(axis)} & 当前程序实例（线程块）在指定轴上的编号 \\
+\texttt{tl.arange(start, end)} & 声明编译期固定大小的块级向量 \\
+\texttt{tl.load(ptr, mask, other)} & 带边界掩码的块级加载，越界处填 \texttt{other} \\
+\texttt{tl.store(ptr, val, mask)} & 带掩码的块级存储 \\
+\texttt{tl.where(cond, a, b)} & 逐元素条件选择（分段函数核心） \\
+\texttt{tl.sum / tl.max / tl.min} & 块内归约（归约算子核心） \\
+\texttt{tl.atomic\_add(ptr, val, mask)} & 原子加（反向传播散射核心） \\
+\texttt{tl.static\_range} & 编译期展开循环（核窗口迭代） \\
+\texttt{@triton.jit} & 即时编译装饰器 \\
+\texttt{@triton.autotune} & 自动调优，按 \texttt{key} 实测选配置 \\
+\texttt{@triton.heuristics} & 启发式配置，编译期推导常量 \\
+\texttt{flag\_gems.libentry} & 顶层 kernel 注册入口（封装 jit + 缓存） \\
+\texttt{flag\_gems.pointwise\_dynamic} & 逐点算子自动代码生成 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{thebibliography}{99}
+\small
+\bibitem{triton} P. Tillet, H. T. Kung, D. Cox, ``Triton: An Intermediate Language and Compiler for Tiled Neural Network Computers,'' \textit{Proc. MAPL}, 2019.
+\bibitem{flaggems} 智源研究院, ``FlagGems: Triton-based GPU Operator Library,'' \url{https://github.com/flagos-ai/FlagGems}, 2025.
+\bibitem{fla} S. Yang et al., ``FLA: Flash Linear Attention Framework,'' \url{https://github.com/sustcsonglin/flash-linear-attention}, 2024.
+\bibitem{deltanet} S. Yang et al., ``Parallelizing Linear Transformers with the Delta Rule over Sequence Length,'' \textit{Proc. NeurIPS}, 2024.
+\bibitem{flashattention} T. Dao, D. Y. Fu, S. Ermon et al., ``FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning,'' \textit{Proc. ICLR}, 2024.
+\bibitem{cuda} NVIDIA Corporation, ``CUDA C++ Programming Guide,'' version 12.x, 2024.
+\bibitem{mlir} C. Lattner et al., ``MLIR: Scaling Compiler Infrastructure for Domain Specific Computation,'' \textit{Proc. CGO}, 2021.
+\bibitem{ctc} A. Graves, S. Fernández, F. Gomez, J. Schmidhuber, ``Connectionist Temporal Classification: Labelling Unsegmented Sequence Data with Recurrent Neural Networks,'' \textit{Proc. ICML}, 2006.
+\bibitem{svd} G. H. Golub, C. F. Van Loan, \textit{Matrix Computations}, 4th ed., Johns Hopkins University Press, 2013.
+\bibitem{pytorch} A. Paszke et al., ``PyTorch: An Imperative Style, High-Performance Deep Learning Library,'' \textit{Proc. NeurIPS}, 2019.
+\end{thebibliography}

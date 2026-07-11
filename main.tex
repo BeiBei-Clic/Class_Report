@@ -56,10 +56,10 @@ footskip=1.5cm %页脚所占高度
 \XeTeXlinebreaklocale "zh" %采用中文断行方式
 \XeTeXlinebreakskip = 0pt plus 1pt %字元间可加入0pt~1pt 的弹性间距，这样才能排出左右对齐的段落。
 
-\setCJKmainfont{Songti SC}
-\setCJKsansfont{Songti SC}	%设置默认字体，防止报警
-\setCJKmonofont{Songti SC} %设置默认字体，防止报警
-\setCJKfamilyfont{song}{Songti SC}
+\setCJKmainfont{Noto Serif CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}	%设置默认字体，防止报警
+\setCJKmonofont{Noto Sans Mono CJK SC} %设置默认字体，防止报警
+\setCJKfamilyfont{song}{Noto Serif CJK SC}
 
 \newcommand{\songti}{\CJKfamily{song}}
 
@@ -106,9 +106,17 @@ footskip=1.5cm %页脚所占高度
   font={capFont}, figurename=Figure,tablename=Table,listfigurename=List of Figures,listtablename=List of Tables}
 \captionsetup[figure]{position=bottom}
 \captionsetup[subfloat]{captionskip=6bp,nearskip=0bp,farskip=0bp,topadjust=0bp, justification=centering,labelformat=brace,labelsep=space,subrefformat=subparens,listofformat=parens}%要使分图题和图题一样字号，选项加上 font={capFont}
-\setlength{\textfloatsep}{8pt plus 2pt minus 2pt}
-\setlength{\floatsep}{8pt plus 2pt minus 2pt}
-\setlength{\intextsep}{8pt plus 2pt minus 2pt}
+\setlength{\textfloatsep}{4pt plus 1pt minus 1pt}
+\setlength{\floatsep}{4pt plus 1pt minus 1pt}
+\setlength{\intextsep}{4pt plus 1pt minus 1pt}
+% 允许一页放置更多浮动体，排版更紧凑
+\setcounter{topnumber}{4}
+\setcounter{bottomnumber}{3}
+\setcounter{totalnumber}{6}
+\renewcommand{\textfraction}{0.1}
+\renewcommand{\floatpagefraction}{0.7}
+\renewcommand{\topfraction}{0.95}
+\renewcommand{\bottomfraction}{0.95}
 
 % 超链接
 \usepackage[hidelinks]{hyperref}
@@ -207,7 +215,7 @@ footskip=1.5cm %页脚所占高度
   captionpos=t,
   framextopmargin=1pt,framexbottommargin=1pt,abovecaptionskip=-1pt,belowcaptionskip=1pt,
   %xleftmargin=4em,xrightmargin=4em, % 设定listing左右的空白
- extendedchars=false,columns=flexible,mathescape=false
+ extendedchars=true,columns=flexible,mathescape=false
   breakautoindent=true
 }
 \renewcommand{\lstlistingname}{代码} %% 重命名Listings标题头 added by Guan
@@ -231,6 +239,10 @@ footskip=1.5cm %页脚所占高度
 \usepackage{tabularx}
 \usetikzlibrary{fadings}
 \usetikzlibrary{patterns}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc, fit, backgrounds, decorations.pathreplacing}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{statistics}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \usepackage[bf, small]{titlesec}
@@ -245,30 +257,31 @@ footskip=1.5cm %页脚所占高度
 \titlespacing{\subsubsection}{0cm}{*0.6}{*0.4}
 
 
-\title{\vspace{-1.5cm} \bf\xiaoerhao Review Report on ``Learning Soft Sparse Shapes for Efficient\\Time-Series Classification''}
-\author{\bf\sihao Yuhong Xu}
+\title{\vspace{-1.5cm} \bf\xiaoerhao 基于 Triton 语言的 FlagGems\\高性能 GPU 算子开发与优化}
+\author{\bf\sihao 徐宇鸿}
 \date{}
 \setlength{\parindent}{0pt} % 首行不缩进
-\linespread{1.6}
+\linespread{1.45}
 %\linespread{2}
 
 %%%%%%%%%%%奇偶页页眉不同
 \usepackage{fancyhdr}
 
 \usepackage{xunicode}
-\renewcommand{\lstlistingname}{列表}
+\renewcommand{\lstlistingname}{代码}
 \pagestyle{fancy}
 \fancyfoot[C]{\wuhao \thepage}
 \fancyhead{}
-\fancyhead[C]{\wuhao{Review Report on SoftShape}}
+\fancyhead[C]{\wuhao{高性能计算课程报告 —— FlagGems Triton 算子开发}}
 \renewcommand{\headrulewidth}{1.5pt}
 \renewcommand{\footrulewidth}{0pt}
 
 \usepackage{indentfirst}
 \usepackage{pdfpages}
 \begin{document}
-  \includepdf[pages={1}]{cover-1.pdf}
-	\captionsetup{labelformat=default,labelsep=space} 
+  % 封面：如有 cover-1.pdf 可取消下一行注释
+  % \includepdf[pages={1}]{cover-1.pdf}
+	\captionsetup{labelformat=default,labelsep=space}
 	\maketitle
   \setcounter{page}{1}
 	\thispagestyle{fancy} % <---
