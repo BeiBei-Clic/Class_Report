@@ -279,8 +279,8 @@ footskip=1.5cm %页脚所占高度
 \usepackage{indentfirst}
 \usepackage{pdfpages}
 \begin{document}
-  % 封面：如有 cover-1.pdf 可取消下一行注释
-  % \includepdf[pages={1}]{cover-1.pdf}
+  % 封面：使用 cover.pdf 作为封面页，且不显示页眉页脚
+  \includepdf[pages={1},pagecommand={\thispagestyle{empty}}]{cover.pdf}
 	\captionsetup{labelformat=default,labelsep=space}
 	\maketitle
   \setcounter{page}{1}
